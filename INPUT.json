@@ -1,0 +1,11 @@
+{
+  "regionId": "6139104",
+  "destination": "London, United Kingdom (LON-All Airports)",
+  "checkInDate": "2026-04-19",
+  "checkOutDate": "2026-04-20",
+  "adults": 2,
+  "children": "",
+  "sort": "RECOMMENDED",
+  "results_wanted": 20,
+  "max_pages": 8
+}

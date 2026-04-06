@@ -1,0 +1,202 @@
+{
+  "actorSpecification": 1,
+  "fields": {
+    "hotel_id": {
+      "title": "Hotel ID",
+      "type": "string",
+      "description": "Expedia hotel ID."
+    },
+    "hotel_name": {
+      "title": "Hotel Name",
+      "type": "string",
+      "description": "Hotel name from listing card."
+    },
+    "city": {
+      "title": "City",
+      "type": "string",
+      "description": "City or area label shown in card."
+    },
+    "star_rating": {
+      "title": "Star Rating",
+      "type": "number",
+      "description": "Official hotel star rating."
+    },
+    "guest_rating": {
+      "title": "Guest Rating (10)",
+      "type": "number",
+      "description": "Guest rating score displayed on card, usually out of 10."
+    },
+    "guest_rating_out_of_five": {
+      "title": "Guest Rating (5)",
+      "type": "number",
+      "description": "Guest rating from analytics payload, usually out of 5."
+    },
+    "review_count": {
+      "title": "Review Count",
+      "type": "integer",
+      "description": "Total number of reviews shown for property."
+    },
+    "review_label": {
+      "title": "Review Label",
+      "type": "string",
+      "description": "Guest score label such as Very Good or Wonderful."
+    },
+    "nightly_price": {
+      "title": "Nightly Price",
+      "type": "string",
+      "description": "Nightly price line shown on listing card."
+    },
+    "total_price": {
+      "title": "Total Price",
+      "type": "string",
+      "description": "Total stay price shown in card price option."
+    },
+    "strikeout_price": {
+      "title": "Strikeout Price",
+      "type": "string",
+      "description": "Previous price shown as strikeout when available."
+    },
+    "taxes_and_fees_note": {
+      "title": "Taxes And Fees Note",
+      "type": "string",
+      "description": "Price note related to taxes and fees."
+    },
+    "free_cancellation": {
+      "title": "Free Cancellation",
+      "type": "boolean",
+      "description": "Whether listing indicates free cancellation."
+    },
+    "member_price_available": {
+      "title": "Member Price Available",
+      "type": "boolean",
+      "description": "Whether listing indicates member pricing is available."
+    },
+    "vacation_rental": {
+      "title": "Vacation Rental",
+      "type": "boolean",
+      "description": "True when listing is a vacation rental product."
+    },
+    "image_url": {
+      "title": "Image URL",
+      "type": "string",
+      "description": "Primary listing image URL."
+    },
+    "property_url": {
+      "title": "Property URL",
+      "type": "string",
+      "description": "Expedia hotel details URL for this listing."
+    },
+    "region_id": {
+      "title": "Region ID",
+      "type": "string",
+      "description": "Search region ID used for request."
+    },
+    "region_name": {
+      "title": "Region Name",
+      "type": "string",
+      "description": "Search region name used for request."
+    },
+    "check_in": {
+      "title": "Check-in",
+      "type": "string",
+      "description": "Check-in date in YYYY-MM-DD format."
+    },
+    "check_out": {
+      "title": "Check-out",
+      "type": "string",
+      "description": "Check-out date in YYYY-MM-DD format."
+    },
+    "adults": {
+      "title": "Adults",
+      "type": "integer",
+      "description": "Adult travelers in room 1."
+    },
+    "children": {
+      "title": "Children",
+      "type": "array",
+      "description": "Child ages in room 1.",
+      "items": {
+        "type": "integer"
+      }
+    },
+    "sort": {
+      "title": "Sort",
+      "type": "string",
+      "description": "Sort mode used by Expedia search."
+    },
+    "search_id": {
+      "title": "Search ID",
+      "type": "string",
+      "description": "Search identifier returned by Expedia listing API."
+    },
+    "source_url": {
+      "title": "Source URL",
+      "type": "string",
+      "description": "API endpoint URL used to fetch listings."
+    },
+    "operation_name": {
+      "title": "Operation Name",
+      "type": "string",
+      "description": "GraphQL operation name used for extraction."
+    },
+    "scraped_at": {
+      "title": "Scraped At",
+      "type": "string",
+      "description": "ISO timestamp when record was captured."
+    }
+  },
+  "views": {
+    "overview": {
+      "title": "Overview",
+      "transformation": {
+        "fields": [
+          "hotel_name",
+          "city",
+          "star_rating",
+          "guest_rating",
+          "review_count",
+          "nightly_price",
+          "total_price",
+          "property_url"
+        ]
+      },
+      "display": {
+        "component": "table",
+        "properties": {
+          "hotel_name": {
+            "label": "Hotel",
+            "format": "text"
+          },
+          "city": {
+            "label": "City",
+            "format": "text"
+          },
+          "star_rating": {
+            "label": "Stars",
+            "format": "number"
+          },
+          "guest_rating": {
+            "label": "Guest Rating",
+            "format": "number"
+          },
+          "review_count": {
+            "label": "Reviews",
+            "format": "number"
+          },
+          "nightly_price": {
+            "label": "Nightly",
+            "format": "text"
+          },
+          "total_price": {
+            "label": "Total",
+            "format": "text"
+          },
+          "property_url": {
+            "label": "Property URL",
+            "format": "link"
+          }
+        }
+      }
+    }
+  }
+}
