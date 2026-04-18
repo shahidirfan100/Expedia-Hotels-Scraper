@@ -7,61 +7,9 @@
     "startUrl": {
       "title": "Expedia Hotel-Search URL",
       "type": "string",
-      "description": "Optional direct Expedia Hotel-Search URL. Leave empty to build the request from the manual filters below.",
+      "description": "Expedia Hotel-Search or Expedia destination URL. Messy, partial, or stale URLs are normalized automatically and missing common search params are healed at runtime.",
       "editor": "textfield",
-      "prefill": ""
-    },
-    "regionId": {
-      "title": "Region ID",
-      "type": "string",
-      "description": "Expedia region ID used when startUrl is not provided.",
-      "editor": "textfield",
-      "prefill": "6139104"
-    },
-    "destination": {
-      "title": "Destination",
-      "type": "string",
-      "description": "Destination label used in Expedia search query.",
-      "editor": "textfield",
-      "prefill": "London, United Kingdom (LON-All Airports)"
-    },
-    "checkInDate": {
-      "title": "Check-in date",
-      "type": "string",
-      "description": "Check-in date in YYYY-MM-DD format.",
-      "editor": "textfield",
-      "prefill": "2026-04-19"
-    },
-    "checkOutDate": {
-      "title": "Check-out date",
-      "type": "string",
-      "description": "Check-out date in YYYY-MM-DD format.",
-      "editor": "textfield",
-      "prefill": "2026-04-20"
-    },
-    "adults": {
-      "title": "Adults",
-      "type": "integer",
-      "description": "Number of adults in room 1.",
-      "minimum": 1,
-      "default": 2,
-      "prefill": 2,
-      "editor": "number"
-    },
-    "children": {
-      "title": "Children ages",
-      "type": "string",
-      "description": "Comma-separated child ages for room 1, for example: 4,8",
-      "editor": "textfield",
-      "prefill": ""
-    },
-    "sort": {
-      "title": "Sort",
-      "type": "string",
-      "description": "Sort order for listings.",
-      "editor": "textfield",
-      "default": "RECOMMENDED",
-      "prefill": "RECOMMENDED"
+      "prefill": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29"
     },
     "results_wanted": {
       "title": "Maximum listings",
@@ -91,6 +39,6 @@
       }
     }
   },
-  "required": [],
+  "required": ["startUrl"],
   "additionalProperties": false
 }

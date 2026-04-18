@@ -34,14 +34,7 @@ Analyze member-price indicators, strikeout price patterns, and cancellation sign
 
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
-| `startUrl` | String | No | Expedia London Hotel-Search URL | Direct Expedia Hotel-Search URL. If provided, it overrides manual filters. |
-| `regionId` | String | No | `6139104` | Expedia region ID used when `startUrl` is not provided. |
-| `destination` | String | No | `London, United Kingdom (LON-All Airports)` | Destination label for the search query. |
-| `checkInDate` | String | No | `2026-04-19` | Check-in date in `YYYY-MM-DD` format. |
-| `checkOutDate` | String | No | `2026-04-20` | Check-out date in `YYYY-MM-DD` format. |
-| `adults` | Integer | No | `2` | Number of adults in room 1. |
-| `children` | String | No | `""` | Comma-separated child ages for room 1 (for example `4,8`). |
-| `sort` | String | No | `RECOMMENDED` | Search sort mode. |
+| `startUrl` | String | Yes | Expedia London Hotel-Search URL | Expedia Hotel-Search or Expedia destination URL. The actor normalizes pasted URLs, strips junk, and auto-fills common missing search params such as dates, adults, and sort. |
 | `results_wanted` | Integer | No | `20` | Maximum number of listings to save. |
 | `max_pages` | Integer | No | `8` | Maximum result-load rounds to attempt. |
 | `proxyConfiguration` | Object | No | Residential Apify Proxy | Proxy settings for stable extraction. |
@@ -91,33 +84,29 @@ Each dataset item can contain:
 
 ```json
 {
-	"startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29&adults=2&children=&sort=RECOMMENDED&useRewards=false&semdtl=&userIntent=&vip=false&startDate=2026-04-19&endDate=2026-04-20&theme=&latLong&pwaDialog=&daysInFuture&stayLength",
+	"startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29",
 	"results_wanted": 20,
 	"max_pages": 8
 }
 ```
 
-### Manual Search Parameters
+### Messy URL Recovery
 
 ```json
 {
-	"regionId": "6139104",
-	"destination": "London, United Kingdom (LON-All Airports)",
-	"checkInDate": "2026-04-19",
-	"checkOutDate": "2026-04-20",
-	"adults": 2,
-	"children": "6",
-	"sort": "RECOMMENDED",
+	"startUrl": "<https://www.expedia.com/Hotel-Search?destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29&regionId=6139104&sort=RECOMMENDED>",
 	"results_wanted": 40,
 	"max_pages": 10
 }
 ```
 
+The actor removes wrapper characters, preserves the Expedia destination, and injects fresh future dates and sane occupancy defaults when they are missing or stale.
+
 ### Proxy-Optimized Run
 
 ```json
 {
-	"startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29&adults=2&children=&sort=RECOMMENDED&useRewards=false&semdtl=&userIntent=&vip=false&startDate=2026-04-19&endDate=2026-04-20&theme=&latLong&pwaDialog=&daysInFuture&stayLength",
+	"startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29",
 	"results_wanted": 30,
 	"proxyConfiguration": {
 		"useApifyProxy": true,
@@ -171,13 +160,17 @@ Each dataset item can contain:
 - Use `results_wanted: 20` first to validate destination and timing.
 - Increase volume only after verifying stable output.
 
+### Use Expedia URLs Only
+- Provide an Expedia Hotel-Search URL or an Expedia destination page URL.
+- The actor repairs missing dates, adults, sort, and common query noise automatically.
+
 ### Use Residential Proxies
 - Residential routing improves reliability on protected travel pages.
 - Keep request volume moderate when collecting large destination sets.
 
 ### Keep Dates Valid
-- Use valid future check-in/check-out values when building URLs from parameters.
-- Ensure check-out is after check-in.
+- If pasted dates are missing or already in the past, the actor shifts them to a safe future stay automatically.
+- If only one date is usable, checkout is healed to the next day.
 
 ### Expect Field Variance
 - Not every listing exposes every field.
@@ -217,6 +210,9 @@ Some Expedia result pages apply request-rate controls. Residential proxies impro
 
 ### Does the actor remove duplicates?
 Yes. Duplicate listing cards are filtered by hotel ID.
+
+### What happens if my URL is incomplete?
+The actor normalizes Expedia URLs, strips wrapper characters and common tracking junk, and retries with a refreshed session when Expedia rejects the first bootstrap attempt.
 
 ---
 

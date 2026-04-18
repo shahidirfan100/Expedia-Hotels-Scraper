@@ -5,7 +5,6 @@ import { Dataset, gotScraping } from 'crawlee';
 
 await Actor.init();
 
-const GRAPHQL_URL = 'https://www.expedia.com/graphql';
 const PROPERTY_LISTING_QUERY = {
     operationName: 'PropertyListingQuery',
     hash: '82abb7da6738db4c904e4d10130072236a751b5a315f6dfaf92474793597bc33',
@@ -16,6 +15,10 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 15.7; rv:147.0) Gecko/20100101 Firefox/147.0',
     'Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0',
 ];
+
+const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
+const DEFAULT_STAY_OFFSET_DAYS = 30;
+const DEFAULT_STAY_LENGTH_DAYS = 1;
 
 function randomUserAgent() {
     return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -68,22 +71,91 @@ function toInteger(value) {
     return Math.trunc(number);
 }
 
+function unwrapEnclosingPairs(value) {
+    let unwrapped = value;
+    const pairs = [
+        ['"', '"'],
+        ["'", "'"],
+        ['`', '`'],
+        ['<', '>'],
+        ['(', ')'],
+        ['[', ']'],
+        ['{', '}'],
+    ];
+
+    let changed = true;
+    while (changed) {
+        changed = false;
+        for (const [opening, closing] of pairs) {
+            if (unwrapped.startsWith(opening) && unwrapped.endsWith(closing)) {
+                unwrapped = unwrapped.slice(1, -1).trim();
+                changed = true;
+            }
+        }
+    }
+
+    return unwrapped;
+}
+
+function normalizeUrlEscapes(value) {
+    return value
+        .replace(/\\u0026/gi, '&')
+        .replace(/\\u003d/gi, '=')
+        .replace(/\\u002f/gi, '/')
+        .replace(/&amp;/gi, '&');
+}
+
+function isExpediaHostname(hostname) {
+    return EXPEDIA_HOST_PATTERN.test(hostname);
+}
+
+function extractNestedExpediaUrl(url) {
+    if (isExpediaHostname(url.hostname)) return undefined;
+
+    for (const key of ['url', 'u', 'target', 'dest', 'redirect', 'redir', 'r']) {
+        const value = cleanText(url.searchParams.get(key));
+        if (value && /expedia\./i.test(value)) return value;
+    }
+
+    return undefined;
+}
+
 function normalizeUrlInput(input) {
     const normalized = cleanText(input);
     if (!normalized) return undefined;
 
-    return normalized
-        .replace(/^[\s"'`<[({]+/, '')
-        .replace(/[\s"'`>\])}.,;!?]+$/, '');
+    const extractedCandidate = normalizeUrlEscapes(unwrapEnclosingPairs(normalized))
+        .match(/https?:\/\/[^\s"'<>]+|(?:www\.)?expedia\.[^\s"'<>]+|\/Hotel-Search[^\s"'<>]*/i)?.[0]
+        || normalizeUrlEscapes(unwrapEnclosingPairs(normalized));
+
+    let candidate = extractedCandidate.trim().replace(/[.,;!?]+$/, '');
+
+    if (candidate.startsWith('/')) {
+        candidate = `https://www.expedia.com${candidate}`;
+    } else if (!/^[a-z]+:\/\//i.test(candidate) && /(?:^|\/)(?:www\.)?expedia\./i.test(candidate)) {
+        candidate = `https://${candidate}`;
+    }
+
+    try {
+        const parsed = new URL(candidate);
+        const nestedUrl = extractNestedExpediaUrl(parsed);
+        if (nestedUrl) return normalizeUrlInput(nestedUrl);
+        return parsed.toString();
+    } catch {
+        return undefined;
+    }
 }
 
 function parseChildrenAges(value) {
     const cleaned = cleanText(value);
     if (!cleaned) return [];
 
-    return cleaned
-        .split(',')
-        .map((entry) => toInteger(entry))
+    const matches = cleaned.match(/\d+/g) || [];
+    if (!matches.length) return [];
+    if (/^\d+$/.test(cleaned) && matches.length === 1) return [];
+
+    return matches
+        .map((entry) => Number(entry))
         .filter((entry) => Number.isInteger(entry) && entry >= 0 && entry <= 17);
 }
 
@@ -110,21 +182,84 @@ function extractMatch(text, pattern) {
     return pattern.exec(text)?.[1];
 }
 
-function buildSearchUrl({ startUrl, regionId, destination, checkInDate, checkOutDate, adults, children, sort }) {
-    const explicitUrl = normalizeUrlInput(startUrl);
-    if (explicitUrl) return explicitUrl;
+function addDays(date, days) {
+    const clone = new Date(date);
+    clone.setUTCDate(clone.getUTCDate() + days);
+    return clone;
+}
 
-    const url = new URL('https://www.expedia.com/Hotel-Search');
-    if (cleanText(regionId)) url.searchParams.set('regionId', String(regionId));
-    if (cleanText(destination)) url.searchParams.set('destination', destination);
-    if (adults !== undefined) url.searchParams.set('adults', String(adults));
-    if (children !== undefined) url.searchParams.set('children', children);
-    if (cleanText(sort)) url.searchParams.set('sort', sort);
-    url.searchParams.set('useRewards', 'false');
-    url.searchParams.set('vip', 'false');
-    if (cleanText(checkInDate)) url.searchParams.set('startDate', checkInDate);
-    if (cleanText(checkOutDate)) url.searchParams.set('endDate', checkOutDate);
-    return url.toString();
+function dateToParts(date) {
+    return {
+        year: date.getUTCFullYear(),
+        month: date.getUTCMonth() + 1,
+        day: date.getUTCDate(),
+    };
+}
+
+function toUtcDate(parts) {
+    return new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
+}
+
+function getTodayUtc() {
+    const now = new Date();
+    return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()));
+}
+
+function getSafeFutureStayDates() {
+    const today = getTodayUtc();
+    const checkIn = addDays(today, DEFAULT_STAY_OFFSET_DAYS);
+    const checkOut = addDays(checkIn, DEFAULT_STAY_LENGTH_DAYS);
+
+    return {
+        checkInDate: formatDateParts(dateToParts(checkIn)),
+        checkOutDate: formatDateParts(dateToParts(checkOut)),
+    };
+}
+
+function resolveStayDates({ checkInDate, checkOutDate }) {
+    const today = getTodayUtc();
+    const defaults = getSafeFutureStayDates();
+
+    let parsedCheckIn = parseDateParts(checkInDate);
+    if (!parsedCheckIn || toUtcDate(parsedCheckIn) < today) {
+        parsedCheckIn = parseDateParts(defaults.checkInDate);
+    }
+
+    let parsedCheckOut = parseDateParts(checkOutDate);
+    if (!parsedCheckOut || toUtcDate(parsedCheckOut) <= toUtcDate(parsedCheckIn)) {
+        parsedCheckOut = dateToParts(addDays(toUtcDate(parsedCheckIn), DEFAULT_STAY_LENGTH_DAYS));
+    }
+
+    return {
+        checkInDate: formatDateParts(parsedCheckIn),
+        checkOutDate: formatDateParts(parsedCheckOut),
+    };
+}
+
+function clampAdults(value) {
+    const adults = toInteger(value);
+    return adults !== undefined ? Math.max(1, Math.min(14, adults)) : 2;
+}
+
+function getFirstSearchParam(url, keys) {
+    for (const key of keys) {
+        const value = cleanText(url.searchParams.get(key));
+        if (value !== undefined) return value;
+    }
+
+    return undefined;
+}
+
+function extractRegionIdFromPathname(pathname) {
+    return pathname.match(/\.d(\d+)\./i)?.[1];
+}
+
+function extractDestinationFromPathname(pathname) {
+    const match = pathname.match(/\/([^/?]+?)-Hotels(?:\.d\d+)?(?:\.Travel-Guide-Hotels)?(?:\/|$)/i)
+        || pathname.match(/\/([^/?]+?)-Travel-Guide(?:\/|$)/i);
+    if (!match) return undefined;
+
+    return cleanText(match[1].replace(/-/g, ' '));
 }
 
 function getSelectionValue(criteria, id) {
@@ -157,17 +292,97 @@ function parseStartUrlSearchInput(startUrl) {
     try {
         const url = new URL(explicitUrl);
         return {
-            regionId: cleanText(url.searchParams.get('regionId')),
-            destination: cleanText(url.searchParams.get('destination')),
-            checkInDate: cleanText(url.searchParams.get('startDate')),
-            checkOutDate: cleanText(url.searchParams.get('endDate')),
-            adults: toInteger(url.searchParams.get('adults')),
-            children: cleanText(url.searchParams.get('children')) || '',
-            sort: cleanText(url.searchParams.get('sort')),
+            rawUrl: url.toString(),
+            origin: url.origin,
+            pathname: url.pathname,
+            regionId: getFirstSearchParam(url, ['regionId', 'regionid']) || extractRegionIdFromPathname(url.pathname),
+            destination: getFirstSearchParam(url, ['destination', 'regionName', 'placeName']) || extractDestinationFromPathname(url.pathname),
+            checkInDate: getFirstSearchParam(url, ['startDate', 'checkInDate', 'checkin', 'checkIn']),
+            checkOutDate: getFirstSearchParam(url, ['endDate', 'checkOutDate', 'checkout', 'checkOut']),
+            adults: toInteger(getFirstSearchParam(url, ['adults', 'adultCount'])),
+            children: getFirstSearchParam(url, ['children', 'childAges']) || '',
+            sort: getFirstSearchParam(url, ['sort', 'sortBy']),
         };
     } catch {
         return {};
     }
+}
+
+function buildCanonicalSearchUrl(searchInput) {
+    const explicitUrl = normalizeUrlInput(searchInput?.rawUrl);
+    const url = explicitUrl ? new URL(explicitUrl) : new URL('https://www.expedia.com/Hotel-Search');
+    const origin = isExpediaHostname(url.hostname) ? url.origin : 'https://www.expedia.com';
+    const canonical = new URL('/Hotel-Search', origin);
+    const { checkInDate, checkOutDate } = resolveStayDates(searchInput || {});
+    const regionId = cleanText(searchInput?.regionId);
+    const destination = cleanText(searchInput?.destination);
+    const sort = cleanText(searchInput?.sort) || 'RECOMMENDED';
+    const children = parseChildrenAges(searchInput?.children).join(',');
+
+    if (regionId) canonical.searchParams.set('regionId', regionId);
+    if (destination) canonical.searchParams.set('destination', destination);
+    canonical.searchParams.set('startDate', checkInDate);
+    canonical.searchParams.set('endDate', checkOutDate);
+    canonical.searchParams.set('adults', String(clampAdults(searchInput?.adults)));
+    canonical.searchParams.set('children', children);
+    canonical.searchParams.set('sort', sort);
+    canonical.searchParams.set('useRewards', 'false');
+    canonical.searchParams.set('vip', 'false');
+
+    return canonical.toString();
+}
+
+function buildSearchUrlCandidates(startUrl) {
+    const parsed = parseStartUrlSearchInput(startUrl);
+    const candidates = [];
+    const addCandidate = (value) => {
+        const normalized = normalizeUrlInput(value);
+        if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
+    };
+
+    addCandidate(parsed.rawUrl || startUrl);
+    addCandidate(buildCanonicalSearchUrl(parsed));
+
+    return candidates;
+}
+
+function resolveNormalizedSearchInput(...sources) {
+    const pickValue = (transform, key) => {
+        for (const source of sources) {
+            if (!source) continue;
+
+            const value = transform(source[key]);
+            if (value !== undefined && value !== '') return value;
+        }
+
+        return undefined;
+    };
+
+    const normalizedInput = {
+        rawUrl: pickValue(normalizeUrlInput, 'rawUrl'),
+        origin: pickValue(cleanText, 'origin'),
+        pathname: pickValue(cleanText, 'pathname'),
+        regionId: pickValue(cleanText, 'regionId'),
+        destination: pickValue(cleanText, 'destination'),
+        adults: clampAdults(pickValue((value) => value, 'adults')),
+        children: pickValue((value) => cleanText(value) || '', 'children') || '',
+        sort: pickValue(cleanText, 'sort') || 'RECOMMENDED',
+    };
+
+    const resolvedDates = resolveStayDates({
+        checkInDate: pickValue(cleanText, 'checkInDate'),
+        checkOutDate: pickValue(cleanText, 'checkOutDate'),
+    });
+
+    normalizedInput.checkInDate = resolvedDates.checkInDate;
+    normalizedInput.checkOutDate = resolvedDates.checkOutDate;
+    normalizedInput.startUrl = buildCanonicalSearchUrl(normalizedInput);
+
+    if (!normalizedInput.regionId && !normalizedInput.destination) {
+        throw new Error('Could not determine destination from startUrl. Provide an Expedia Hotel-Search or Expedia destination page URL that contains a destination or region.');
+    }
+
+    return normalizedInput;
 }
 
 function getSchemaFieldValue(fieldSchema) {
@@ -191,69 +406,12 @@ async function loadInputSchemaDefaults() {
 
         return {
             startUrl: normalizeUrlInput(getSchemaFieldValue(properties.startUrl)),
-            regionId: cleanText(getSchemaFieldValue(properties.regionId)),
-            destination: cleanText(getSchemaFieldValue(properties.destination)),
-            checkInDate: cleanText(getSchemaFieldValue(properties.checkInDate)),
-            checkOutDate: cleanText(getSchemaFieldValue(properties.checkOutDate)),
-            adults: toInteger(getSchemaFieldValue(properties.adults)),
-            children: cleanText(getSchemaFieldValue(properties.children)) || '',
-            sort: cleanText(getSchemaFieldValue(properties.sort)),
             results_wanted: toInteger(getSchemaFieldValue(properties.results_wanted)),
             max_pages: toInteger(getSchemaFieldValue(properties.max_pages)),
         };
     } catch {
         return {};
     }
-}
-
-function hasOwnInputValue(input, key) {
-    return Object.prototype.hasOwnProperty.call(input, key);
-}
-
-function normalizeComparableInputValue(key, value) {
-    if (key === 'startUrl') return normalizeUrlInput(value);
-    if (key === 'adults' || key === 'results_wanted' || key === 'max_pages') return toInteger(value);
-    if (key === 'children') return parseChildrenAges(value).join(',');
-    return cleanText(value);
-}
-
-function hasCustomInputValue(input, schemaDefaults, key) {
-    if (!hasOwnInputValue(input, key)) return false;
-
-    return normalizeComparableInputValue(key, input[key]) !== normalizeComparableInputValue(key, schemaDefaults[key]);
-}
-
-function resolveRuntimeSearchInput(input, schemaDefaults) {
-    const normalizedStartUrl = normalizeUrlInput(input.startUrl);
-    const manualModeKeys = ['regionId', 'destination', 'checkInDate', 'checkOutDate', 'adults', 'children', 'sort'];
-    const startUrlSearchInput = parseStartUrlSearchInput(normalizedStartUrl);
-    const hasConflictingManualFilters = manualModeKeys.some((key) => {
-        if (!hasCustomInputValue(input, schemaDefaults, key)) return false;
-
-        return normalizeComparableInputValue(key, input[key]) !== normalizeComparableInputValue(key, startUrlSearchInput[key]);
-    });
-    const useStartUrl = Boolean(normalizedStartUrl) && !hasConflictingManualFilters;
-
-    const regionIdChanged = hasCustomInputValue(input, schemaDefaults, 'regionId');
-    const destinationChanged = hasCustomInputValue(input, schemaDefaults, 'destination');
-
-    return {
-        mode: useStartUrl ? 'startUrl' : 'manualFilters',
-        requestInput: {
-            startUrl: useStartUrl ? normalizedStartUrl : undefined,
-            regionId: destinationChanged && !regionIdChanged
-                ? undefined
-                : cleanText(input.regionId ?? schemaDefaults.regionId),
-            destination: regionIdChanged && !destinationChanged
-                ? undefined
-                : cleanText(input.destination ?? schemaDefaults.destination),
-            checkInDate: cleanText(input.checkInDate ?? schemaDefaults.checkInDate),
-            checkOutDate: cleanText(input.checkOutDate ?? schemaDefaults.checkOutDate),
-            adults: toInteger(input.adults ?? schemaDefaults.adults) ?? 2,
-            children: cleanText(input.children ?? schemaDefaults.children) || '',
-            sort: cleanText(input.sort ?? schemaDefaults.sort) || 'RECOMMENDED',
-        },
-    };
 }
 
 function buildBootstrapData(html, cookieHeader) {
@@ -486,9 +644,46 @@ async function fetchSearchPage({ searchUrl, userAgent, proxyUrl }) {
     return response;
 }
 
-async function fetchListingBatch({ searchUrl, userAgent, proxyUrl, cookieHeader, bootstrapData, payload }) {
+async function bootstrapSearchSession({ searchUrlCandidates, proxyConfiguration }) {
+    let lastError;
+    const maxAttempts = proxyConfiguration ? 3 : 2;
+
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        const userAgent = randomUserAgent();
+        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+
+        for (const searchUrl of searchUrlCandidates) {
+            try {
+                const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
+                const html = String(pageResponse.body || '');
+                const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
+                const bootstrapData = buildBootstrapData(html, cookieHeader);
+
+                return {
+                    pageResponse,
+                    searchUrl,
+                    userAgent,
+                    proxyUrl,
+                    cookieHeader,
+                    bootstrapData,
+                };
+            } catch (error) {
+                lastError = error;
+                log.warning('Search session bootstrap failed, retrying with next recovery path.', {
+                    attempt,
+                    searchUrl,
+                    message: error.message,
+                });
+            }
+        }
+    }
+
+    throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
+}
+
+async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, cookieHeader, bootstrapData, payload }) {
     const response = await gotScraping({
-        url: GRAPHQL_URL,
+        url: graphQlUrl,
         method: 'POST',
         headers: {
             'user-agent': userAgent,
@@ -532,50 +727,24 @@ async function main() {
     const input = await loadInput();
     const schemaDefaults = await loadInputSchemaDefaults();
     const {
+        startUrl: startUrlRaw,
         results_wanted: resultsWantedRaw,
         max_pages: maxPagesRaw,
         proxyConfiguration: proxyInput,
     } = input;
-
-    const { mode, requestInput } = resolveRuntimeSearchInput(input, schemaDefaults);
-    const {
-        startUrl,
-        regionId,
-        destination,
-        checkInDate,
-        checkOutDate,
-        adults: adultsRaw,
-        children,
-        sort,
-    } = requestInput;
-
-    const parsedCheckIn = parseDateParts(checkInDate);
-    const parsedCheckOut = parseDateParts(checkOutDate);
-    if (!normalizeUrlInput(startUrl) && (!parsedCheckIn || !parsedCheckOut)) {
-        throw new Error('Missing valid checkInDate/checkOutDate (YYYY-MM-DD) when startUrl is not provided.');
+    const startUrl = normalizeUrlInput(startUrlRaw ?? schemaDefaults.startUrl);
+    if (!startUrl) {
+        throw new Error('Missing startUrl. Provide an Expedia Hotel-Search URL or Expedia destination/listing URL.');
     }
 
     const resultsWantedSource = resultsWantedRaw ?? schemaDefaults.results_wanted;
     const maxPagesSource = maxPagesRaw ?? schemaDefaults.max_pages;
     const resultsWanted = Number.isFinite(+resultsWantedSource) ? Math.max(1, Math.min(500, +resultsWantedSource)) : 20;
     const maxPages = Number.isFinite(+maxPagesSource) ? Math.max(1, Math.min(50, +maxPagesSource)) : 8;
-    const adults = Number.isFinite(+adultsRaw) ? Math.max(1, Math.min(14, Math.trunc(+adultsRaw))) : 2;
-
-    const normalizedInput = {
-        startUrl: normalizeUrlInput(startUrl),
-        regionId: cleanText(regionId),
-        destination: cleanText(destination),
-        checkInDate,
-        checkOutDate,
-        adults,
-        children,
-        sort: cleanText(sort) || 'RECOMMENDED',
-    };
-
-    const searchUrl = buildSearchUrl({
-        ...normalizedInput,
-        children: parseChildrenAges(children).join(','),
-    });
+    const searchUrlCandidates = buildSearchUrlCandidates(startUrl);
+    if (!searchUrlCandidates.length) {
+        throw new Error('Could not normalize startUrl into a valid Expedia URL.');
+    }
 
     let proxyConfiguration;
     if (proxyInput) {
@@ -587,51 +756,88 @@ async function main() {
             });
         }
     }
-
-    const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
-    const userAgent = randomUserAgent();
     const scrapedAt = new Date().toISOString();
 
+    let searchSession = await bootstrapSearchSession({ searchUrlCandidates, proxyConfiguration });
+    let normalizedInput = resolveNormalizedSearchInput(
+        parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
+        parseStartUrlSearchInput(searchSession.searchUrl),
+        parseStartUrlSearchInput(startUrl),
+    );
+    let graphQlUrl = new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
+
     log.info('Starting Expedia hotel listing extraction', {
-        searchUrl,
-        searchMode: mode,
+        startUrl,
+        searchUrl: normalizedInput.startUrl,
+        recoveryCandidates: searchUrlCandidates.length,
         operationName: PROPERTY_LISTING_QUERY.operationName,
         operationHash: PROPERTY_LISTING_QUERY.hash,
         resultsWanted,
         maxPages,
-        usingProxy: Boolean(proxyUrl),
+        usingProxy: Boolean(searchSession.proxyUrl),
     });
-
-    const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
-    const html = String(pageResponse.body || '');
-    const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
-    const bootstrapData = buildBootstrapData(html, cookieHeader);
 
     const seenHotelIds = new Set();
     const records = [];
-    let startIndex = bootstrapData.resultsStartingIndex;
-    const batchSize = bootstrapData.resultsSize;
+    let startIndex = searchSession.bootstrapData.resultsStartingIndex;
+    const batchSize = searchSession.bootstrapData.resultsSize;
 
     for (let pageNumber = 1; pageNumber <= maxPages && records.length < resultsWanted; pageNumber++) {
-        const payload = buildRequestPayload({
+        let payload = buildRequestPayload({
             input: normalizedInput,
-            bootstrapData,
+            bootstrapData: searchSession.bootstrapData,
             startIndex,
             size: batchSize,
         });
 
-        const result = await fetchListingBatch({
-            searchUrl: pageResponse.url || searchUrl,
-            userAgent,
-            proxyUrl,
-            cookieHeader,
-            bootstrapData,
-            payload,
-        });
+        let result;
+        try {
+            result = await fetchListingBatch({
+                graphQlUrl,
+                searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
+                userAgent: searchSession.userAgent,
+                proxyUrl: searchSession.proxyUrl,
+                cookieHeader: searchSession.cookieHeader,
+                bootstrapData: searchSession.bootstrapData,
+                payload,
+            });
+        } catch (error) {
+            log.warning('Listing batch failed, refreshing the search session before retrying once.', {
+                pageNumber,
+                startIndex,
+                message: error.message,
+            });
 
-        const criteria = payload.variables.criteria;
+            searchSession = await bootstrapSearchSession({
+                searchUrlCandidates: [normalizedInput.startUrl, ...searchUrlCandidates],
+                proxyConfiguration,
+            });
+            normalizedInput = resolveNormalizedSearchInput(
+                parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
+                parseStartUrlSearchInput(normalizedInput.startUrl),
+                parseStartUrlSearchInput(startUrl),
+            );
+            graphQlUrl = new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
+            payload = buildRequestPayload({
+                input: normalizedInput,
+                bootstrapData: searchSession.bootstrapData,
+                startIndex,
+                size: batchSize,
+            });
+            result = await fetchListingBatch({
+                graphQlUrl,
+                searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
+                userAgent: searchSession.userAgent,
+                proxyUrl: searchSession.proxyUrl,
+                cookieHeader: searchSession.cookieHeader,
+                bootstrapData: searchSession.bootstrapData,
+                payload,
+            });
+        }
+
+        const { criteria } = payload.variables;
         const analyticsMap = buildAnalyticsMap(result);
-        const cards = (result?.data?.propertySearch?.propertySearchListings || []).filter((entry) => entry?.__typename === 'LodgingCard');
+        const cards = (result?.data?.propertySearch?.propertySearchListings || []).filter((entry) => Reflect.get(entry || {}, '__typename') === 'LodgingCard');
 
         if (!cards.length) break;
 
@@ -644,7 +850,7 @@ async function main() {
                 card,
                 criteria,
                 analyticsItem,
-                sourceUrl: GRAPHQL_URL,
+                sourceUrl: graphQlUrl,
                 scrapedAt,
             });
 

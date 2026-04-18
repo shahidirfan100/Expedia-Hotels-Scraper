@@ -1,11 +1,5 @@
 {
-  "regionId": "6139104",
-  "destination": "London, United Kingdom (LON-All Airports)",
-  "checkInDate": "2026-04-19",
-  "checkOutDate": "2026-04-20",
-  "adults": 2,
-  "children": "",
-  "sort": "RECOMMENDED",
+  "startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29",
   "results_wanted": 20,
   "max_pages": 8
 }
