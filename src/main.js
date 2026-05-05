@@ -21,10 +21,10 @@ const DEFAULT_STAY_OFFSET_DAYS = 30;
 const DEFAULT_STAY_LENGTH_DAYS = 1;
 const BOOTSTRAP_RETRYABLE_STATUS_CODES = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
 const BOOTSTRAP_RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']);
-const BOOTSTRAP_BASE_BACKOFF_MS = 1400;
-const BOOTSTRAP_MAX_BACKOFF_MS = 14000;
-const BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY = 3;
-const BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY = 5;
+const BOOTSTRAP_BASE_BACKOFF_MS = 900;
+const BOOTSTRAP_MAX_BACKOFF_MS = 4500;
+const BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY = 2;
+const BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY = 3;
 
 function randomUserAgent() {
     return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -338,10 +338,36 @@ function isBootstrapRetryableError(error) {
 }
 
 function getBootstrapBackoffMs({ attempt, statusCode }) {
-    const statusBoost = statusCode === 429 ? 1200 : 0;
+    const statusBoost = statusCode === 429 ? 600 : 0;
     const exponential = BOOTSTRAP_BASE_BACKOFF_MS * (2 ** Math.max(0, attempt - 1));
-    const jitter = Math.floor(Math.random() * 900);
+    const jitter = Math.floor(Math.random() * 450);
     return Math.min(BOOTSTRAP_MAX_BACKOFF_MS, exponential + statusBoost + jitter);
+}
+
+function shouldSkipRemainingSearchUrls(error) {
+    const statusCode = getErrorStatusCode(error);
+    if (statusCode !== undefined) {
+        if (statusCode === 403 || statusCode === 429) return true;
+        if (statusCode >= 590 && statusCode <= 599) return true;
+    }
+
+    const code = cleanText(error?.code) || '';
+    if (BOOTSTRAP_RETRYABLE_ERROR_CODES.has(code)) return true;
+
+    const message = cleanText(error?.message) || '';
+    return /upstream5\d\d|proxy responded with 59\d/i.test(message);
+}
+
+function shouldAbandonBootstrapStrategy({ error, attempt, hasProxy }) {
+    const statusCode = getErrorStatusCode(error);
+    if (statusCode === 429) return attempt >= 2;
+    if (statusCode === 403) return attempt >= (hasProxy ? 2 : 1);
+    if (statusCode !== undefined && statusCode >= 590 && statusCode <= 599) return true;
+
+    const code = cleanText(error?.code) || '';
+    if (BOOTSTRAP_RETRYABLE_ERROR_CODES.has(code)) return attempt >= 2;
+
+    return false;
 }
 
 function normalizeProxyConfigurationInput(proxyInput) {
@@ -489,8 +515,8 @@ function buildSearchUrlCandidates(startUrl) {
         if (normalized && !candidates.includes(normalized)) candidates.push(normalized);
     };
 
-    addCandidate(parsed.rawUrl || startUrl);
     addCandidate(buildCanonicalSearchUrl(parsed));
+    addCandidate(parsed.rawUrl || startUrl);
 
     return candidates;
 }
@@ -819,6 +845,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     for (const strategy of proxyStrategies) {
         const hasProxy = Boolean(strategy.proxyConfiguration);
         const maxAttempts = hasProxy ? BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY : BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY;
+        let abortStrategy = false;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             const userAgent = randomUserAgent();
@@ -839,7 +866,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                 }
             }
 
-            for (const searchUrl of searchUrlCandidates) {
+            for (const [candidateIndex, searchUrl] of searchUrlCandidates.entries()) {
                 try {
                     const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
                     const html = String(pageResponse.body || '');
@@ -859,6 +886,8 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     lastError = error;
                     const statusCode = getErrorStatusCode(error);
                     const retryable = isBootstrapRetryableError(error);
+                    const skipRemainingSearchUrls = shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
+                    const abandonStrategyEarly = shouldAbandonBootstrapStrategy({ error, attempt, hasProxy });
                     log.warning('Search session bootstrap failed, retrying with next recovery path.', {
                         strategy: strategy.label,
                         attempt,
@@ -869,11 +898,32 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                         message: toErrorMessage(error),
                     });
 
-                    if (retryable) {
+                    if (retryable && !abandonStrategyEarly) {
                         await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
+                    }
+
+                    if (skipRemainingSearchUrls) {
+                        log.info('Skipping alternate bootstrap URLs for this attempt because the current failure is strategy-level.', {
+                            strategy: strategy.label,
+                            attempt,
+                            statusCode,
+                        });
+                        break;
+                    }
+
+                    if (abandonStrategyEarly) {
+                        abortStrategy = true;
+                        log.info('Abandoning bootstrap strategy early after repeated blocking responses.', {
+                            strategy: strategy.label,
+                            attempt,
+                            statusCode,
+                        });
+                        break;
                     }
                 }
             }
+
+            if (abortStrategy) break;
         }
     }
 
