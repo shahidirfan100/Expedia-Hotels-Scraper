@@ -32,10 +32,10 @@
     "proxyConfiguration": {
       "title": "Proxy configuration",
       "type": "object",
-      "description": "Residential proxy is strongly recommended for reliable extraction.",
+      "description": "Apify proxy is recommended. The actor auto-heals by trying multiple proxy strategies, including residential fallback.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": false
+        "useApifyProxy": true
       }
     }
   },

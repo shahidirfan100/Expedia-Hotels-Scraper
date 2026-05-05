@@ -19,6 +19,12 @@ const USER_AGENTS = [
 const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
 const DEFAULT_STAY_OFFSET_DAYS = 30;
 const DEFAULT_STAY_LENGTH_DAYS = 1;
+const BOOTSTRAP_RETRYABLE_STATUS_CODES = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
+const BOOTSTRAP_RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']);
+const BOOTSTRAP_BASE_BACKOFF_MS = 1400;
+const BOOTSTRAP_MAX_BACKOFF_MS = 14000;
+const BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY = 3;
+const BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY = 5;
 
 function randomUserAgent() {
     return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -283,6 +289,149 @@ function normalizeResourceUrl(resource) {
 
 function parseCookieHeader(setCookieHeaders = []) {
     return setCookieHeaders.map((entry) => entry.split(';')[0]).join('; ');
+}
+
+function sleep(milliseconds) {
+    return new Promise((resolve) => {
+        setTimeout(resolve, milliseconds);
+    });
+}
+
+function toErrorMessage(error) {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    return cleanText(error.message) || 'Unknown error';
+}
+
+function createHttpStatusError(message, statusCode) {
+    const error = new Error(message);
+    error.statusCode = statusCode;
+    return error;
+}
+
+function getErrorStatusCode(error) {
+    const statusCode = toInteger(error?.statusCode);
+    if (statusCode !== undefined) return statusCode;
+
+    const message = cleanText(error?.message) || '';
+    const proxyMatch = message.match(/\bProxy responded with\s+(\d{3})\b/i);
+    if (proxyMatch) return toInteger(proxyMatch[1]);
+
+    const genericMatch = message.match(/\bstatus\s+(\d{3})\b/i);
+    if (genericMatch) return toInteger(genericMatch[1]);
+
+    return undefined;
+}
+
+function isBootstrapRetryableError(error) {
+    const statusCode = getErrorStatusCode(error);
+    if (statusCode !== undefined) {
+        if (BOOTSTRAP_RETRYABLE_STATUS_CODES.has(statusCode)) return true;
+        if (statusCode >= 590 && statusCode <= 599) return true;
+    }
+
+    const code = cleanText(error?.code) || '';
+    if (BOOTSTRAP_RETRYABLE_ERROR_CODES.has(code)) return true;
+
+    const message = cleanText(error?.message) || '';
+    return /upstream5\d\d|proxy responded with 59\d/i.test(message);
+}
+
+function getBootstrapBackoffMs({ attempt, statusCode }) {
+    const statusBoost = statusCode === 429 ? 1200 : 0;
+    const exponential = BOOTSTRAP_BASE_BACKOFF_MS * (2 ** Math.max(0, attempt - 1));
+    const jitter = Math.floor(Math.random() * 900);
+    return Math.min(BOOTSTRAP_MAX_BACKOFF_MS, exponential + statusBoost + jitter);
+}
+
+function normalizeProxyConfigurationInput(proxyInput) {
+    if (!proxyInput || typeof proxyInput !== 'object') return proxyInput;
+
+    const normalized = { ...proxyInput };
+    if (!Array.isArray(normalized.groups) && Array.isArray(normalized.apifyProxyGroups)) {
+        normalized.groups = normalized.apifyProxyGroups;
+    }
+
+    return normalized;
+}
+
+function inferPreferredCountryCodeFromStartUrl(startUrl) {
+    const parsed = parseStartUrlSearchInput(startUrl);
+    const destination = cleanText(parsed.destination)?.toLowerCase() || '';
+
+    if (/united kingdom|\buk\b|england|london|scotland|wales|northern ireland/.test(destination)) return 'GB';
+    if (/united states|\busa\b|new york|los angeles|chicago|miami/.test(destination)) return 'US';
+    if (/canada|toronto|vancouver|montreal/.test(destination)) return 'CA';
+    if (/australia|sydney|melbourne|brisbane/.test(destination)) return 'AU';
+    if (/india|delhi|mumbai|bangalore/.test(destination)) return 'IN';
+    if (/pakistan|karachi|lahore|islamabad/.test(destination)) return 'PK';
+    if (/germany|berlin|munich|frankfurt/.test(destination)) return 'DE';
+    if (/france|paris|lyon|marseille/.test(destination)) return 'FR';
+    if (/italy|rome|milan|florence/.test(destination)) return 'IT';
+    if (/spain|madrid|barcelona|valencia/.test(destination)) return 'ES';
+
+    return undefined;
+}
+
+async function buildProxyStrategies(proxyInput, startUrl) {
+    const strategies = [];
+    const usedLabels = new Set();
+    const addStrategy = (label, proxyConfiguration) => {
+        if (usedLabels.has(label)) return;
+        usedLabels.add(label);
+        strategies.push({ label, proxyConfiguration });
+    };
+
+    let userProxyConfiguration;
+    const normalizedProxyInput = normalizeProxyConfigurationInput(proxyInput);
+    if (normalizedProxyInput) {
+        try {
+            userProxyConfiguration = await Actor.createProxyConfiguration(normalizedProxyInput);
+            if (userProxyConfiguration) addStrategy('input_proxy_configuration', userProxyConfiguration);
+        } catch (error) {
+            log.warning('Proxy configuration initialization failed, continuing with fallback strategies.', {
+                message: toErrorMessage(error),
+            });
+        }
+    } else {
+        addStrategy('direct_no_proxy', undefined);
+    }
+
+    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
+    const hasLocalApifyCredentials = Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
+    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
+    const preferredCountryCode = inferPreferredCountryCodeFromStartUrl(startUrl);
+    const canUseApifyFallback = !isExplicitlyNoApifyProxy;
+
+    if (canUseApifyFallback && shouldTryApifyFallback) {
+        const fallbackConfigs = [
+            ...(preferredCountryCode ? [{
+                label: `auto_residential_${preferredCountryCode.toLowerCase()}`,
+                options: { useApifyProxy: true, groups: ['RESIDENTIAL'], countryCode: preferredCountryCode },
+            }] : []),
+            { label: 'auto_residential_us', options: { useApifyProxy: true, groups: ['RESIDENTIAL'], countryCode: 'US' } },
+            { label: 'auto_residential_any', options: { useApifyProxy: true, groups: ['RESIDENTIAL'] } },
+            { label: 'auto_apify_proxy', options: { useApifyProxy: true } },
+        ];
+
+        for (const fallback of fallbackConfigs) {
+            try {
+                const proxyConfiguration = await Actor.createProxyConfiguration(fallback.options);
+                if (proxyConfiguration) addStrategy(fallback.label, proxyConfiguration);
+            } catch (error) {
+                log.warning('Could not initialize proxy fallback strategy.', {
+                    strategy: fallback.label,
+                    message: toErrorMessage(error),
+                });
+            }
+        }
+    }
+
+    if (!strategies.some((entry) => entry.label === 'direct_no_proxy')) {
+        addStrategy('direct_no_proxy', undefined);
+    }
+
+    return strategies;
 }
 
 function parseStartUrlSearchInput(startUrl) {
@@ -629,6 +778,9 @@ async function fetchSearchPage({ searchUrl, userAgent, proxyUrl }) {
         headers: {
             'user-agent': userAgent,
             'accept-language': 'en-US,en;q=0.9',
+            'cache-control': 'max-age=0',
+            pragma: 'no-cache',
+            'upgrade-insecure-requests': '1',
             accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         },
         proxyUrl,
@@ -638,44 +790,96 @@ async function fetchSearchPage({ searchUrl, userAgent, proxyUrl }) {
     });
 
     if (response.statusCode < 200 || response.statusCode >= 400) {
-        throw new Error(`Search page request failed with status ${response.statusCode}`);
+        throw createHttpStatusError(`Search page request failed with status ${response.statusCode}`, response.statusCode);
     }
 
     return response;
 }
 
-async function bootstrapSearchSession({ searchUrlCandidates, proxyConfiguration }) {
+async function loadApiDiscoveryOverrides() {
+    try {
+        const raw = await readFile(new URL('../API_DISCOVERY.md', import.meta.url), 'utf8');
+        const operationName = cleanText(extractMatch(raw, /- Operation:\s*([^\r\n]+)/i));
+        const persistedQueryHash = cleanText(extractMatch(raw, /- Persisted Query Hash:\s*([a-f0-9]{32,128})/i));
+        const endpoint = cleanText(extractMatch(raw, /- Endpoint:\s*(https?:\/\/[^\s\r\n]+)/i));
+
+        return compactObject({
+            operationName,
+            persistedQueryHash,
+            endpoint,
+        }) || {};
+    } catch {
+        return {};
+    }
+}
+
+async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) {
     let lastError;
-    const maxAttempts = proxyConfiguration ? 3 : 2;
 
-    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        const userAgent = randomUserAgent();
-        const proxyUrl = proxyConfiguration ? await proxyConfiguration.newUrl() : undefined;
+    for (const strategy of proxyStrategies) {
+        const hasProxy = Boolean(strategy.proxyConfiguration);
+        const maxAttempts = hasProxy ? BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY : BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY;
 
-        for (const searchUrl of searchUrlCandidates) {
-            try {
-                const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
-                const html = String(pageResponse.body || '');
-                const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
-                const bootstrapData = buildBootstrapData(html, cookieHeader);
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const userAgent = randomUserAgent();
+            let proxyUrl;
 
-                return {
-                    pageResponse,
-                    searchUrl,
-                    userAgent,
-                    proxyUrl,
-                    cookieHeader,
-                    bootstrapData,
-                };
-            } catch (error) {
-                lastError = error;
-                log.warning('Search session bootstrap failed, retrying with next recovery path.', {
-                    attempt,
-                    searchUrl,
-                    message: error.message,
-                });
+            if (strategy.proxyConfiguration) {
+                try {
+                    const sessionId = `bootstrap${crypto.randomUUID().replace(/-/g, '').slice(0, 18)}`;
+                    proxyUrl = await strategy.proxyConfiguration.newUrl(sessionId);
+                } catch (error) {
+                    lastError = error;
+                    log.warning('Proxy URL generation failed, switching strategy.', {
+                        strategy: strategy.label,
+                        attempt,
+                        message: toErrorMessage(error),
+                    });
+                    break;
+                }
+            }
+
+            for (const searchUrl of searchUrlCandidates) {
+                try {
+                    const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
+                    const html = String(pageResponse.body || '');
+                    const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
+                    const bootstrapData = buildBootstrapData(html, cookieHeader);
+
+                    return {
+                        pageResponse,
+                        searchUrl,
+                        userAgent,
+                        proxyUrl,
+                        cookieHeader,
+                        bootstrapData,
+                        proxyStrategy: strategy.label,
+                    };
+                } catch (error) {
+                    lastError = error;
+                    const statusCode = getErrorStatusCode(error);
+                    const retryable = isBootstrapRetryableError(error);
+                    log.warning('Search session bootstrap failed, retrying with next recovery path.', {
+                        strategy: strategy.label,
+                        attempt,
+                        searchUrl,
+                        proxyEnabled: hasProxy,
+                        statusCode,
+                        retryable,
+                        message: toErrorMessage(error),
+                    });
+
+                    if (retryable) {
+                        await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
+                    }
+                }
             }
         }
+    }
+
+    const statusCode = getErrorStatusCode(lastError);
+    if (statusCode === 429) {
+        throw new Error('Could not initialize Expedia search session from startUrl. Expedia returned anti-bot 429/challenge responses. Enable Apify residential proxy in proxyConfiguration and retry.');
     }
 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
@@ -726,6 +930,16 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, c
 async function main() {
     const input = await loadInput();
     const schemaDefaults = await loadInputSchemaDefaults();
+    const apiDiscoveryOverrides = await loadApiDiscoveryOverrides();
+    if (apiDiscoveryOverrides.operationName) PROPERTY_LISTING_QUERY.operationName = apiDiscoveryOverrides.operationName;
+    if (apiDiscoveryOverrides.persistedQueryHash) PROPERTY_LISTING_QUERY.hash = apiDiscoveryOverrides.persistedQueryHash;
+    if (Object.keys(apiDiscoveryOverrides).length) {
+        log.info('Loaded API discovery overrides.', {
+            operationName: apiDiscoveryOverrides.operationName || PROPERTY_LISTING_QUERY.operationName,
+            operationHash: apiDiscoveryOverrides.persistedQueryHash || PROPERTY_LISTING_QUERY.hash,
+            endpoint: apiDiscoveryOverrides.endpoint || 'derived_from_search_page',
+        });
+    }
     const {
         startUrl: startUrlRaw,
         results_wanted: resultsWantedRaw,
@@ -746,25 +960,20 @@ async function main() {
         throw new Error('Could not normalize startUrl into a valid Expedia URL.');
     }
 
-    let proxyConfiguration;
-    if (proxyInput) {
-        try {
-            proxyConfiguration = await Actor.createProxyConfiguration(proxyInput);
-        } catch (error) {
-            log.warning('Proxy configuration initialization failed, continuing without proxy', {
-                message: error.message,
-            });
-        }
-    }
+    const proxyStrategies = await buildProxyStrategies(proxyInput, startUrl);
+    log.info('Prepared proxy recovery strategies.', {
+        strategies: proxyStrategies.map((entry) => entry.label),
+    });
     const scrapedAt = new Date().toISOString();
 
-    let searchSession = await bootstrapSearchSession({ searchUrlCandidates, proxyConfiguration });
+    let searchSession = await bootstrapSearchSession({ searchUrlCandidates, proxyStrategies });
     let normalizedInput = resolveNormalizedSearchInput(
         parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
         parseStartUrlSearchInput(searchSession.searchUrl),
         parseStartUrlSearchInput(startUrl),
     );
-    let graphQlUrl = new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
+    let graphQlUrl = apiDiscoveryOverrides.endpoint
+        || new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
 
     log.info('Starting Expedia hotel listing extraction', {
         startUrl,
@@ -775,6 +984,7 @@ async function main() {
         resultsWanted,
         maxPages,
         usingProxy: Boolean(searchSession.proxyUrl),
+        proxyStrategy: searchSession.proxyStrategy,
     });
 
     const seenHotelIds = new Set();
@@ -810,14 +1020,15 @@ async function main() {
 
             searchSession = await bootstrapSearchSession({
                 searchUrlCandidates: [normalizedInput.startUrl, ...searchUrlCandidates],
-                proxyConfiguration,
+                proxyStrategies,
             });
             normalizedInput = resolveNormalizedSearchInput(
                 parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
                 parseStartUrlSearchInput(normalizedInput.startUrl),
                 parseStartUrlSearchInput(startUrl),
             );
-            graphQlUrl = new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
+            graphQlUrl = apiDiscoveryOverrides.endpoint
+                || new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
             payload = buildRequestPayload({
                 input: normalizedInput,
                 bootstrapData: searchSession.bootstrapData,
