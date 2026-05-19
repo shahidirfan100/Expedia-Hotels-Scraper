@@ -11,7 +11,7 @@
       "editor": "textfield",
       "prefill": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29"
     },
-    "results_wanted": {
+    "resultsWanted": {
       "title": "Maximum listings",
       "type": "integer",
       "description": "Maximum number of hotel listings to save.",
@@ -20,7 +20,7 @@
       "prefill": 20,
       "editor": "number"
     },
-    "max_pages": {
+    "maxPages": {
       "title": "Maximum page loads",
       "type": "integer",
       "description": "Maximum result-load rounds to attempt while scrolling/loading more.",

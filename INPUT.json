@@ -1,7 +1,7 @@
 {
   "startUrl": "https://www.expedia.com/Hotel-Search?regionId=6139104&destination=London%2C%20United%20Kingdom%20%28LON-All%20Airports%29",
-  "results_wanted": 20,
-  "max_pages": 8,
+  "resultsWanted": 20,
+  "maxPages": 8,
   "proxyConfiguration": {
     "useApifyProxy": true
   }

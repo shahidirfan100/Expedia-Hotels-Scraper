@@ -578,11 +578,13 @@ async function loadInputSchemaDefaults() {
         const raw = await readFile(new URL('../.actor/input_schema.json', import.meta.url), 'utf8');
         const schema = JSON.parse(raw);
         const properties = schema?.properties || {};
+        const resultsWantedField = properties.resultsWanted || properties.results_wanted;
+        const maxPagesField = properties.maxPages || properties.max_pages;
 
         return {
             startUrl: normalizeUrlInput(getSchemaFieldValue(properties.startUrl)),
-            results_wanted: toInteger(getSchemaFieldValue(properties.results_wanted)),
-            max_pages: toInteger(getSchemaFieldValue(properties.max_pages)),
+            resultsWanted: toInteger(getSchemaFieldValue(resultsWantedField)),
+            maxPages: toInteger(getSchemaFieldValue(maxPagesField)),
         };
     } catch {
         return {};
@@ -992,7 +994,9 @@ async function main() {
     }
     const {
         startUrl: startUrlRaw,
+        resultsWanted: resultsWantedCamelRaw,
         results_wanted: resultsWantedRaw,
+        maxPages: maxPagesCamelRaw,
         max_pages: maxPagesRaw,
         proxyConfiguration: proxyInput,
     } = input;
@@ -1001,8 +1005,12 @@ async function main() {
         throw new Error('Missing startUrl. Provide an Expedia Hotel-Search URL or Expedia destination/listing URL.');
     }
 
-    const resultsWantedSource = resultsWantedRaw ?? schemaDefaults.results_wanted;
-    const maxPagesSource = maxPagesRaw ?? schemaDefaults.max_pages;
+    const resultsWantedSource = resultsWantedCamelRaw
+        ?? resultsWantedRaw
+        ?? schemaDefaults.resultsWanted;
+    const maxPagesSource = maxPagesCamelRaw
+        ?? maxPagesRaw
+        ?? schemaDefaults.maxPages;
     const resultsWanted = Number.isFinite(+resultsWantedSource) ? Math.max(1, Math.min(500, +resultsWantedSource)) : 20;
     const maxPages = Number.isFinite(+maxPagesSource) ? Math.max(1, Math.min(50, +maxPagesSource)) : 8;
     const searchUrlCandidates = buildSearchUrlCandidates(startUrl);
