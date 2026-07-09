@@ -14,6 +14,11 @@ const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 15.7; rv:147.0) Gecko/20100101 Firefox/147.0',
     'Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36',
 ];
 
 const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
@@ -25,6 +30,15 @@ const BOOTSTRAP_BASE_BACKOFF_MS = 900;
 const BOOTSTRAP_MAX_BACKOFF_MS = 4500;
 const BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY = 2;
 const BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY = 3;
+
+const GRAPHQL_RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
+const GRAPHQL_RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT', 'ENOTFOUND', 'ENETUNREACH']);
+const GRAPHQL_BASE_BACKOFF_MS = 1000;
+const GRAPHQL_MAX_BACKOFF_MS = 10000;
+const GRAPHQL_MAX_ATTEMPTS = 3;
+
+const PAGE_REQUEST_DELAY_MIN_MS = 1500;
+const PAGE_REQUEST_DELAY_MAX_MS = 4000;
 
 function randomUserAgent() {
     return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
@@ -295,6 +309,67 @@ function sleep(milliseconds) {
     return new Promise((resolve) => {
         setTimeout(resolve, milliseconds);
     });
+}
+
+function getCaseInsensitive(obj, key) {
+    if (!obj || typeof obj !== 'object') return undefined;
+    if (Object.prototype.hasOwnProperty.call(obj, key)) return obj[key];
+    const lower = key.toLowerCase();
+    for (const k of Object.keys(obj)) {
+        if (k.toLowerCase() === lower) return obj[k];
+    }
+    return undefined;
+}
+
+function getNestedCaseInsensitive(obj, ...keys) {
+    let current = obj;
+    for (const key of keys) {
+        if (current == null || typeof current !== 'object') return undefined;
+        if (Array.isArray(current)) {
+            const index = Number(key);
+            current = Number.isFinite(index) ? current[index] : undefined;
+        } else {
+            current = getCaseInsensitive(current, key);
+        }
+    }
+    return current;
+}
+
+async function retryWithBackoff(fn, options = {}) {
+    const {
+        label = 'request',
+        maxAttempts = GRAPHQL_MAX_ATTEMPTS,
+        baseBackoffMs = GRAPHQL_BASE_BACKOFF_MS,
+        maxBackoffMs = GRAPHQL_MAX_BACKOFF_MS,
+        retryableStatusCodes = GRAPHQL_RETRYABLE_STATUS_CODES,
+        retryableErrorCodes = GRAPHQL_RETRYABLE_ERROR_CODES,
+    } = options;
+
+    let lastError;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            return await fn(attempt);
+        } catch (error) {
+            lastError = error;
+            const statusCode = getErrorStatusCode(error);
+            const isRetryable = statusCode
+                ? retryableStatusCodes.has(statusCode)
+                : retryableErrorCodes.has(error?.code)
+                    || /timeout|econnreset|eai_again|etimedout|enotfound|enetunreach/i.test(error?.message || '');
+
+            if (!isRetryable || attempt === maxAttempts) throw error;
+
+            const jitter = Math.floor(Math.random() * 500);
+            const delay = Math.min(maxBackoffMs, baseBackoffMs * (2 ** (attempt - 1)) + (statusCode === 429 ? 2000 : 0) + jitter);
+            log.warning(`${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms`, {
+                statusCode,
+                message: toErrorMessage(error),
+            });
+            await sleep(delay);
+        }
+    }
+
+    throw lastError;
 }
 
 function toErrorMessage(error) {
@@ -626,6 +701,7 @@ function buildBootstrapData(html, cookieHeader) {
         duaid,
         resultsStartingIndex: resultsStartingIndex ?? 3,
         resultsSize: resultsSize ?? 97,
+        ctxViewId: crypto.randomUUID(),
     };
 }
 
@@ -703,7 +779,7 @@ function parseProductAnalytics(card) {
 
     for (const event of events) {
         const attribute = event?.attribute;
-        if (attribute?.name !== 'product_list') continue;
+        if (!attribute || (cleanText(attribute.name) || '').toLowerCase() !== 'product_list') continue;
 
         const content = cleanText(attribute.content);
         if (!content) continue;
@@ -721,11 +797,12 @@ function parseProductAnalytics(card) {
 }
 
 function buildAnalyticsMap(result) {
-    const items = result?.extensions?.analytics?.[0]?.tealiumUtagData?.entity?.hotels?.results?.results || [];
+    const raw = getNestedCaseInsensitive(result, 'extensions', 'analytics', '0', 'tealiumUtagData', 'entity', 'hotels', 'results', 'results');
+    const items = Array.isArray(raw) ? raw : [];
     const analyticsMap = new Map();
 
     for (const item of items) {
-        const hotelId = cleanText(item?.hotelId);
+        const hotelId = cleanText(getCaseInsensitive(item, 'hotelId'));
         if (hotelId) analyticsMap.set(hotelId, item);
     }
 
@@ -888,38 +965,38 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     lastError = error;
                     const statusCode = getErrorStatusCode(error);
                     const retryable = isBootstrapRetryableError(error);
-                    const skipRemainingSearchUrls = shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
                     const abandonStrategyEarly = shouldAbandonBootstrapStrategy({ error, attempt, hasProxy });
-                    log.warning('Search session bootstrap failed, retrying with next recovery path.', {
-                        strategy: strategy.label,
-                        attempt,
-                        searchUrl,
-                        proxyEnabled: hasProxy,
-                        statusCode,
-                        retryable,
-                        message: toErrorMessage(error),
-                    });
+                    const skipRemainingSearchUrls = shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
 
-                    if (retryable && !abandonStrategyEarly) {
-                        await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
-                    }
-
-                    if (skipRemainingSearchUrls) {
-                        log.info('Skipping alternate bootstrap URLs for this attempt because the current failure is strategy-level.', {
+                    if (abandonStrategyEarly) {
+                        abortStrategy = true;
+                        log.warning('Bootstrap strategy abandoned after repeated blocking responses.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
+                            message: toErrorMessage(error),
                         });
                         break;
                     }
 
-                    if (abandonStrategyEarly) {
-                        abortStrategy = true;
-                        log.info('Abandoning bootstrap strategy early after repeated blocking responses.', {
+                    if (retryable) {
+                        log.info('Bootstrap attempt failed, retrying.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
+                            message: toErrorMessage(error),
                         });
+                        await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
+                    } else {
+                        log.warning('Bootstrap failed with non-retryable error.', {
+                            strategy: strategy.label,
+                            attempt,
+                            statusCode,
+                            message: toErrorMessage(error),
+                        });
+                    }
+
+                    if (skipRemainingSearchUrls) {
                         break;
                     }
                 }
@@ -937,46 +1014,88 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
 }
 
-async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, cookieHeader, bootstrapData, payload }) {
-    const response = await gotScraping({
-        url: graphQlUrl,
-        method: 'POST',
-        headers: {
-            'user-agent': userAgent,
-            accept: '*/*',
+function getBrowserHeaders(userAgent) {
+    const isChrome = /Chrome\//.test(userAgent) && !/Edg\//.test(userAgent);
+    const isEdge = /Edg\//.test(userAgent);
+    const isMobile = /Mobile|Android|iPhone|iPad/.test(userAgent);
+    const extra = {};
+
+    if (isChrome || isEdge) {
+        const brand = isEdge ? 'Microsoft Edge' : 'Google Chrome';
+        const version = userAgent.match(/Chrome\/(\d+)/)?.[1] || '126';
+        extra['sec-ch-ua'] = `"Not/A)Brand";v="99", "${brand}";v="${version}", "Chromium";v="${version}"`;
+        extra['sec-ch-ua-mobile'] = isMobile ? '?1' : '?0';
+        if (/Windows/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"Windows"';
+        else if (/Mac/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"macOS"';
+        else if (/Linux|Android/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"Linux"';
+        else extra['sec-ch-ua-platform'] = '"macOS"';
+    }
+
+    return extra;
+}
+
+async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
+    return retryWithBackoff(async (attempt) => {
+        const ua = attempt > 1 ? randomUserAgent() : userAgent;
+        const headers = {
+            ...getBrowserHeaders(ua),
+            'user-agent': ua,
+            accept: 'application/json, text/plain, */*',
+            'accept-encoding': 'gzip, deflate, br',
             'accept-language': 'en-US',
+            'cache-control': 'no-cache',
             'content-type': 'application/json',
             'client-info': bootstrapData.clientInfo,
             'x-page-id': bootstrapData.pageId,
             'x-enable-apq': 'true',
             'x-shopping-product-line': 'lodging',
-            'ctx-view-id': crypto.randomUUID(),
+            'ctx-view-id': bootstrapData.ctxViewId,
             origin: 'https://www.expedia.com',
             referer: searchUrl,
             cookie: cookieHeader,
+            te: 'trailers',
             'sec-fetch-dest': 'empty',
             'sec-fetch-mode': 'cors',
             'sec-fetch-site': 'same-origin',
-        },
-        json: [payload],
-        responseType: 'json',
-        proxyUrl,
-        retry: { limit: 0 },
-        timeout: { request: 60000 },
-        throwHttpErrors: false,
-    });
+        };
 
-    if (response.statusCode < 200 || response.statusCode >= 400) {
-        const errorBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
-        throw new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${errorBody.slice(0, 300)}`);
-    }
+        const response = await gotScraping({
+            url: graphQlUrl,
+            method: 'POST',
+            headers,
+            json: [payload],
+            responseType: 'json',
+            proxyUrl,
+            retry: { limit: 0 },
+            timeout: { request: 60000 },
+            throwHttpErrors: false,
+        });
 
-    const result = Array.isArray(response.body) ? response.body[0] : response.body;
-    if (Array.isArray(result?.errors) && result.errors.length) {
-        throw new Error(result.errors.map((entry) => entry.message).filter(Boolean).join('; '));
-    }
+        if (cookieState && response.headers['set-cookie']) {
+            // eslint-disable-next-line no-param-reassign
+            cookieState.cookieHeader = parseCookieHeader(response.headers['set-cookie']);
+        }
 
-    return result;
+        if (response.statusCode < 200 || response.statusCode >= 400) {
+            const errorBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
+            const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${errorBody.slice(0, 300)}`);
+            error.statusCode = response.statusCode;
+            throw error;
+        }
+
+        const result = Array.isArray(response.body) ? response.body[0] : response.body;
+        const hasErrors = Array.isArray(result?.errors) && result.errors.length;
+        if (hasErrors) {
+            const messages = result.errors.map((entry) => entry.message).filter(Boolean);
+            const isFatal = messages.some((m) => /not found|unauthorized|forbidden/i.test(m));
+            if (isFatal) throw new Error(messages.join('; '));
+            log.warning('GraphQL response contained non-fatal errors, continuing with partial data.', {
+                errors: messages.join('; '),
+            });
+        }
+
+        return result;
+    }, { label: 'PropertyListingQuery', maxAttempts: GRAPHQL_MAX_ATTEMPTS, baseBackoffMs: GRAPHQL_BASE_BACKOFF_MS, maxBackoffMs: GRAPHQL_MAX_BACKOFF_MS });
 }
 
 async function main() {
@@ -1034,8 +1153,7 @@ async function main() {
         || new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
 
     log.info('Starting Expedia hotel listing extraction', {
-        startUrl,
-        searchUrl: normalizedInput.startUrl,
+        startUrl: normalizedInput.startUrl,
         recoveryCandidates: searchUrlCandidates.length,
         operationName: PROPERTY_LISTING_QUERY.operationName,
         operationHash: PROPERTY_LISTING_QUERY.hash,
@@ -1049,6 +1167,7 @@ async function main() {
     const records = [];
     let startIndex = searchSession.bootstrapData.resultsStartingIndex;
     const batchSize = searchSession.bootstrapData.resultsSize;
+    const cookieState = { cookieHeader: searchSession.cookieHeader };
 
     for (let pageNumber = 1; pageNumber <= maxPages && records.length < resultsWanted; pageNumber++) {
         let payload = buildRequestPayload({
@@ -1065,9 +1184,10 @@ async function main() {
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
                 userAgent: searchSession.userAgent,
                 proxyUrl: searchSession.proxyUrl,
-                cookieHeader: searchSession.cookieHeader,
+                cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
                 payload,
+                cookieState,
             });
         } catch (error) {
             log.warning('Listing batch failed, refreshing the search session before retrying once.', {
@@ -1080,6 +1200,7 @@ async function main() {
                 searchUrlCandidates: [normalizedInput.startUrl, ...searchUrlCandidates],
                 proxyStrategies,
             });
+            cookieState.cookieHeader = searchSession.cookieHeader;
             normalizedInput = resolveNormalizedSearchInput(
                 parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
                 parseStartUrlSearchInput(normalizedInput.startUrl),
@@ -1098,41 +1219,58 @@ async function main() {
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
                 userAgent: searchSession.userAgent,
                 proxyUrl: searchSession.proxyUrl,
-                cookieHeader: searchSession.cookieHeader,
+                cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
                 payload,
+                cookieState,
             });
         }
 
         const { criteria } = payload.variables;
         const analyticsMap = buildAnalyticsMap(result);
-        const cards = (result?.data?.propertySearch?.propertySearchListings || []).filter((entry) => Reflect.get(entry || {}, '__typename') === 'LodgingCard');
+        const listings = getNestedCaseInsensitive(result, 'data', 'propertySearch', 'propertySearchListings');
+        const cards = (Array.isArray(listings) ? listings : []).filter((entry) => {
+            const typeName = cleanText(getCaseInsensitive(entry || {}, '__typename'));
+            return typeName && typeName.toLowerCase() === 'lodgingcard';
+        });
 
         if (!cards.length) break;
 
         for (const card of cards) {
             if (records.length >= resultsWanted) break;
 
-            const hotelId = cleanText(card?.id);
-            const analyticsItem = hotelId ? analyticsMap.get(hotelId) : undefined;
-            const record = normalizeHotelRecord({
-                card,
-                criteria,
-                analyticsItem,
-                sourceUrl: graphQlUrl,
-                scrapedAt,
-            });
+            try {
+                const hotelId = cleanText(card?.id);
+                const analyticsItem = hotelId ? analyticsMap.get(hotelId) : undefined;
+                const record = normalizeHotelRecord({
+                    card,
+                    criteria,
+                    analyticsItem,
+                    sourceUrl: graphQlUrl,
+                    scrapedAt,
+                });
 
-            if (!record?.hotel_id || seenHotelIds.has(record.hotel_id)) continue;
+                if (!record?.hotel_id || seenHotelIds.has(record.hotel_id)) continue;
 
-            seenHotelIds.add(record.hotel_id);
-            records.push(record);
+                seenHotelIds.add(record.hotel_id);
+                records.push(record);
+            } catch (error) {
+                log.warning('Skipped hotel card due to processing error.', {
+                    hotelId: cleanText(card?.id),
+                    message: toErrorMessage(error),
+                });
+            }
         }
 
         log.info(`Saved ${records.length}/${resultsWanted} hotel listings after page ${pageNumber}`);
 
         if (cards.length < batchSize) break;
         startIndex += batchSize;
+
+        if (pageNumber < maxPages && records.length < resultsWanted) {
+            const pageDelay = PAGE_REQUEST_DELAY_MIN_MS + Math.floor(Math.random() * (PAGE_REQUEST_DELAY_MAX_MS - PAGE_REQUEST_DELAY_MIN_MS));
+            await sleep(pageDelay);
+        }
     }
 
     if (!records.length) {
