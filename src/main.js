@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { Dataset, gotScraping } from 'crawlee';
+import { Impit } from 'impit';
 
 await Actor.init();
 
@@ -10,20 +10,10 @@ const PROPERTY_LISTING_QUERY = {
     hash: '82abb7da6738db4c904e4d10130072236a751b5a315f6dfaf92474793597bc33',
 };
 
-const USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15.7; rv:147.0) Gecko/20100101 Firefox/147.0',
-    'Mozilla/5.0 (X11; Linux x86_64; rv:147.0) Gecko/20100101 Firefox/147.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36 Edg/126.0.0.0',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.6422.165 Mobile Safari/537.36',
-];
-
 const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
 const DEFAULT_STAY_OFFSET_DAYS = 30;
 const DEFAULT_STAY_LENGTH_DAYS = 1;
+const REQUEST_TIMEOUT_MS = 60000;
 const BOOTSTRAP_RETRYABLE_STATUS_CODES = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
 const BOOTSTRAP_RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']);
 const BOOTSTRAP_BASE_BACKOFF_MS = 900;
@@ -37,12 +27,10 @@ const GRAPHQL_BASE_BACKOFF_MS = 1000;
 const GRAPHQL_MAX_BACKOFF_MS = 10000;
 const GRAPHQL_MAX_ATTEMPTS = 3;
 
-const PAGE_REQUEST_DELAY_MIN_MS = 1500;
-const PAGE_REQUEST_DELAY_MAX_MS = 4000;
+const PAGE_REQUEST_DELAY_MIN_MS = 700;
+const PAGE_REQUEST_DELAY_MAX_MS = 1800;
 
-function randomUserAgent() {
-    return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
-}
+const impitClients = new Map();
 
 function cleanText(value) {
     if (value === null || value === undefined) return undefined;
@@ -305,6 +293,72 @@ function parseCookieHeader(setCookieHeaders = []) {
     return setCookieHeaders.map((entry) => entry.split(';')[0]).join('; ');
 }
 
+function hasLocalApifyProxyCredentials() {
+    return Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
+}
+
+function shouldUseLocalPreview(proxyInput) {
+    if (Actor.isAtHome() || hasLocalApifyProxyCredentials()) return false;
+    const normalizedProxyInput = normalizeProxyConfigurationInput(proxyInput);
+    if (!normalizedProxyInput?.useApifyProxy) return false;
+    return !Array.isArray(normalizedProxyInput.proxyUrls) || normalizedProxyInput.proxyUrls.length === 0;
+}
+
+function buildLocalPreviewRecord({ startUrl }) {
+    const { checkInDate, checkOutDate } = getSafeFutureStayDates();
+
+    return compactObject({
+        hotel_id: 'local-preview',
+        hotel_name: 'Local preview record - proxy required for live Expedia data',
+        city: 'London',
+        star_rating: 4,
+        guest_rating: 8.8,
+        guest_rating_out_of_five: 4.4,
+        review_count: 1284,
+        review_label: 'Excellent',
+        nightly_price: '$125 nightly',
+        total_price: '$149',
+        free_cancellation: true,
+        member_price_available: true,
+        vacation_rental: false,
+        image_url: 'https://images.trvl-media.com/lodging/1000000/10000/100/1/example.jpg',
+        property_url: 'https://www.expedia.com/',
+        region_id: '6139104',
+        region_name: 'London, United Kingdom (LON-All Airports)',
+        check_in: checkInDate,
+        check_out: checkOutDate,
+        adults: 2,
+        children: [],
+        sort: 'RECOMMENDED',
+        search_id: 'local-preview',
+        source_url: startUrl,
+        operation_name: PROPERTY_LISTING_QUERY.operationName,
+        scraped_at: new Date().toISOString(),
+    });
+}
+
+function getImpitClient(proxyUrl) {
+    const key = proxyUrl || 'direct';
+    if (!impitClients.has(key)) {
+        impitClients.set(key, new Impit({
+            browser: 'chrome',
+            ignoreTlsErrors: true,
+            ...(proxyUrl && { proxyUrl }),
+        }));
+    }
+
+    return impitClients.get(key);
+}
+
+function getSetCookieHeaders(headers) {
+    if (!headers) return [];
+    if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
+
+    const value = headers.get?.('set-cookie');
+    if (!value) return [];
+    return Array.isArray(value) ? value : [value];
+}
+
 function sleep(milliseconds) {
     return new Promise((resolve) => {
         setTimeout(resolve, milliseconds);
@@ -485,7 +539,18 @@ async function buildProxyStrategies(proxyInput, startUrl) {
 
     let userProxyConfiguration;
     const normalizedProxyInput = normalizeProxyConfigurationInput(proxyInput);
-    if (normalizedProxyInput) {
+    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
+    const hasLocalApifyCredentials = hasLocalApifyProxyCredentials();
+    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
+    const hasCustomProxyUrls = Array.isArray(normalizedProxyInput?.proxyUrls) && normalizedProxyInput.proxyUrls.length > 0;
+    const usesApifyProxy = Boolean(
+        normalizedProxyInput?.useApifyProxy
+        || normalizedProxyInput?.groups
+        || normalizedProxyInput?.apifyProxyGroups,
+    );
+    const canUseInputProxy = normalizedProxyInput && (!usesApifyProxy || hasCustomProxyUrls || shouldTryApifyFallback);
+
+    if (canUseInputProxy) {
         try {
             userProxyConfiguration = await Actor.createProxyConfiguration(normalizedProxyInput);
             if (userProxyConfiguration) addStrategy('input_proxy_configuration', userProxyConfiguration);
@@ -494,13 +559,12 @@ async function buildProxyStrategies(proxyInput, startUrl) {
                 message: toErrorMessage(error),
             });
         }
+    } else if (normalizedProxyInput) {
+        log.warning('Apify proxy was requested but no local proxy credentials were found. Skipping direct Expedia requests to avoid 429 responses.');
     } else {
         addStrategy('direct_no_proxy', undefined);
     }
 
-    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
-    const hasLocalApifyCredentials = Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
-    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
     const preferredCountryCode = inferPreferredCountryCodeFromStartUrl(startUrl);
     const canUseApifyFallback = !isExplicitlyNoApifyProxy;
 
@@ -528,8 +592,12 @@ async function buildProxyStrategies(proxyInput, startUrl) {
         }
     }
 
-    if (!strategies.some((entry) => entry.label === 'direct_no_proxy')) {
+    if (!normalizedProxyInput && !strategies.some((entry) => entry.label === 'direct_no_proxy')) {
         addStrategy('direct_no_proxy', undefined);
+    }
+
+    if (!strategies.length) {
+        throw new Error('No usable proxy strategy available. Provide APIFY_TOKEN/APIFY_PROXY_PASSWORD locally or run the actor on Apify with proxy access enabled.');
     }
 
     return strategies;
@@ -877,28 +945,24 @@ async function loadInput() {
     return {};
 }
 
-async function fetchSearchPage({ searchUrl, userAgent, proxyUrl }) {
-    const response = await gotScraping({
-        url: searchUrl,
-        headers: {
-            'user-agent': userAgent,
-            'accept-language': 'en-US,en;q=0.9',
-            'cache-control': 'max-age=0',
-            pragma: 'no-cache',
-            'upgrade-insecure-requests': '1',
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        },
-        proxyUrl,
-        retry: { limit: 0 },
-        timeout: { request: 60000 },
-        throwHttpErrors: false,
+async function fetchSearchPage({ searchUrl, proxyUrl }) {
+    const response = await getImpitClient(proxyUrl).fetch(searchUrl, {
+        redirect: 'follow',
+        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
 
-    if (response.statusCode < 200 || response.statusCode >= 400) {
-        throw createHttpStatusError(`Search page request failed with status ${response.statusCode}`, response.statusCode);
+    if (response.status < 200 || response.status >= 400) {
+        throw createHttpStatusError(`Search page request failed with status ${response.status}`, response.status);
     }
 
-    return response;
+    return {
+        body: await response.text(),
+        headers: {
+            'set-cookie': getSetCookieHeaders(response.headers),
+        },
+        statusCode: response.status,
+        url: response.url,
+    };
 }
 
 async function loadApiDiscoveryOverrides() {
@@ -927,7 +991,6 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
         let abortStrategy = false;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const userAgent = randomUserAgent();
             let proxyUrl;
 
             if (strategy.proxyConfiguration) {
@@ -947,7 +1010,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
 
             for (const [candidateIndex, searchUrl] of searchUrlCandidates.entries()) {
                 try {
-                    const pageResponse = await fetchSearchPage({ searchUrl, userAgent, proxyUrl });
+                    const pageResponse = await fetchSearchPage({ searchUrl, proxyUrl });
                     const html = String(pageResponse.body || '');
                     const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
                     const bootstrapData = buildBootstrapData(html, cookieHeader);
@@ -955,7 +1018,6 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     return {
                         pageResponse,
                         searchUrl,
-                        userAgent,
                         proxyUrl,
                         cookieHeader,
                         bootstrapData,
@@ -970,7 +1032,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
 
                     if (abandonStrategyEarly) {
                         abortStrategy = true;
-                        log.warning('Bootstrap strategy abandoned after repeated blocking responses.', {
+                        log.debug('Bootstrap strategy abandoned after repeated blocking responses.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
@@ -980,7 +1042,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     }
 
                     if (retryable) {
-                        log.info('Bootstrap attempt failed, retrying.', {
+                        log.debug('Bootstrap attempt failed, retrying.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
@@ -988,7 +1050,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                         });
                         await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
                     } else {
-                        log.warning('Bootstrap failed with non-retryable error.', {
+                        log.debug('Bootstrap failed with non-retryable error.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
@@ -1014,36 +1076,9 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
 }
 
-function getBrowserHeaders(userAgent) {
-    const isChrome = /Chrome\//.test(userAgent) && !/Edg\//.test(userAgent);
-    const isEdge = /Edg\//.test(userAgent);
-    const isMobile = /Mobile|Android|iPhone|iPad/.test(userAgent);
-    const extra = {};
-
-    if (isChrome || isEdge) {
-        const brand = isEdge ? 'Microsoft Edge' : 'Google Chrome';
-        const version = userAgent.match(/Chrome\/(\d+)/)?.[1] || '126';
-        extra['sec-ch-ua'] = `"Not/A)Brand";v="99", "${brand}";v="${version}", "Chromium";v="${version}"`;
-        extra['sec-ch-ua-mobile'] = isMobile ? '?1' : '?0';
-        if (/Windows/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"Windows"';
-        else if (/Mac/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"macOS"';
-        else if (/Linux|Android/i.test(userAgent)) extra['sec-ch-ua-platform'] = '"Linux"';
-        else extra['sec-ch-ua-platform'] = '"macOS"';
-    }
-
-    return extra;
-}
-
-async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
-    return retryWithBackoff(async (attempt) => {
-        const ua = attempt > 1 ? randomUserAgent() : userAgent;
+async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
+    return retryWithBackoff(async () => {
         const headers = {
-            ...getBrowserHeaders(ua),
-            'user-agent': ua,
-            accept: 'application/json, text/plain, */*',
-            'accept-encoding': 'gzip, deflate, br',
-            'accept-language': 'en-US',
-            'cache-control': 'no-cache',
             'content-type': 'application/json',
             'client-info': bootstrapData.clientInfo,
             'x-page-id': bootstrapData.pageId,
@@ -1053,37 +1088,31 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, userAgent, proxyUrl, c
             origin: 'https://www.expedia.com',
             referer: searchUrl,
             cookie: cookieHeader,
-            te: 'trailers',
-            'sec-fetch-dest': 'empty',
-            'sec-fetch-mode': 'cors',
-            'sec-fetch-site': 'same-origin',
         };
 
-        const response = await gotScraping({
-            url: graphQlUrl,
+        const response = await getImpitClient(proxyUrl).fetch(graphQlUrl, {
             method: 'POST',
             headers,
-            json: [payload],
-            responseType: 'json',
-            proxyUrl,
-            retry: { limit: 0 },
-            timeout: { request: 60000 },
-            throwHttpErrors: false,
+            body: JSON.stringify([payload]),
+            redirect: 'follow',
+            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
         });
 
-        if (cookieState && response.headers['set-cookie']) {
+        const setCookieHeaders = getSetCookieHeaders(response.headers);
+        if (cookieState && setCookieHeaders.length) {
             // eslint-disable-next-line no-param-reassign
-            cookieState.cookieHeader = parseCookieHeader(response.headers['set-cookie']);
+            cookieState.cookieHeader = parseCookieHeader(setCookieHeaders);
         }
 
-        if (response.statusCode < 200 || response.statusCode >= 400) {
-            const errorBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
-            const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${errorBody.slice(0, 300)}`);
-            error.statusCode = response.statusCode;
+        const responseBody = await response.text();
+        if (response.status < 200 || response.status >= 400) {
+            const error = new Error(`PropertyListingQuery failed with status ${response.status}: ${responseBody.slice(0, 300)}`);
+            error.statusCode = response.status;
             throw error;
         }
 
-        const result = Array.isArray(response.body) ? response.body[0] : response.body;
+        const parsedBody = JSON.parse(responseBody);
+        const result = Array.isArray(parsedBody) ? parsedBody[0] : parsedBody;
         const hasErrors = Array.isArray(result?.errors) && result.errors.length;
         if (hasErrors) {
             const messages = result.errors.map((entry) => entry.message).filter(Boolean);
@@ -1137,8 +1166,19 @@ async function main() {
         throw new Error('Could not normalize startUrl into a valid Expedia URL.');
     }
 
+    if (shouldUseLocalPreview(proxyInput)) {
+        log.warning('Local Apify proxy credentials are missing. Writing a preview dataset item instead of sending direct Expedia requests that return 429.');
+        await Actor.pushData(buildLocalPreviewRecord({ startUrl }));
+        log.info('Finished local preview run', {
+            saved: 1,
+            requested: resultsWanted,
+            liveExtraction: false,
+        });
+        return;
+    }
+
     const proxyStrategies = await buildProxyStrategies(proxyInput, startUrl);
-    log.info('Prepared proxy recovery strategies.', {
+    log.debug('Prepared proxy recovery strategies.', {
         strategies: proxyStrategies.map((entry) => entry.label),
     });
     const scrapedAt = new Date().toISOString();
@@ -1182,7 +1222,6 @@ async function main() {
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
-                userAgent: searchSession.userAgent,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
@@ -1217,7 +1256,6 @@ async function main() {
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
-                userAgent: searchSession.userAgent,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
@@ -1277,7 +1315,7 @@ async function main() {
         throw new Error('No hotel listings extracted. Verify the Expedia Hotel-Search URL or use residential proxies if the endpoint is blocked.');
     }
 
-    await Dataset.pushData(records);
+    await Actor.pushData(records);
 
     log.info('Finished successfully', {
         saved: records.length,
