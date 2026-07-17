@@ -5,7 +5,7 @@
   "type": "module",
   "dependencies": {
     "apify": "^3.7.0",
-    "impit": "^0.14.2"
+    "crawlee": "^3.16.0"
   },
   "devDependencies": {
     "@apify/eslint-config": "^1.0.0",

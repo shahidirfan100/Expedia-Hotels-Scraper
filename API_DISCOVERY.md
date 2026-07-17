@@ -16,6 +16,16 @@
 - Direct got-scraping request to the Hotel-Search page returned valid Akamai/session cookies and HTML state containing searchId, productOffersId, app version, region, and pageId.
 - Replaying PropertyListingQuery with those bootstrap cookies plus derived client-info and page headers returned hotel listings JSON with HTTP 200.
 - Pagination works directly by incrementing resultsStartingIndex while reusing the same bootstrap session.
+- Bootstrap and GraphQL replay must keep a coherent browser profile. Do not mix mobile user agents with desktop client hints, and do not rotate the GraphQL profile independently from the cookie/session profile that succeeded at bootstrap.
+
+## Request Profile Matrix
+| Candidate | Header profile | Use | Decision |
+|---|---|---|---|
+| Web GraphQL | Desktop Chrome headers + matching sec-ch-ua | First bootstrap/API replay attempt | selected primary |
+| Web GraphQL | Android Chrome mobile web headers + matching MOBILE device context | Early fallback when desktop profile is blocked | selected fallback |
+| Web GraphQL | Firefox desktop headers without Chromium client hints | Additional fallback when Chrome profile is blocked | selected fallback |
+| Web GraphQL | iOS Safari mobile web headers without Chromium client hints | Later fallback when Chromium-style profiles are blocked | selected fallback |
+| Android app style | okhttp-style app headers | Not used against web Hotel-Search/bootstrap flow because Expedia web GraphQL needs browser cookies/page state | rejected for runtime |
 
 ## Selected Response Fields
 - hotel_id

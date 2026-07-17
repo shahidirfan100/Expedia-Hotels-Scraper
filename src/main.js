@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { Impit } from 'impit';
+import { Dataset, gotScraping } from 'crawlee';
 
 await Actor.init();
 
@@ -10,10 +10,43 @@ const PROPERTY_LISTING_QUERY = {
     hash: '82abb7da6738db4c904e4d10130072236a751b5a315f6dfaf92474793597bc33',
 };
 
+const REQUEST_PROFILES = [
+    {
+        name: 'chrome_windows',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        deviceType: 'DESKTOP',
+        platform: '"Windows"',
+        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
+    },
+    {
+        name: 'android_chrome',
+        userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
+        deviceType: 'MOBILE',
+        platform: '"Android"',
+        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
+    },
+    {
+        name: 'firefox_windows',
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
+        deviceType: 'DESKTOP',
+    },
+    {
+        name: 'ios_safari',
+        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+        deviceType: 'MOBILE',
+    },
+    {
+        name: 'chrome_macos',
+        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+        deviceType: 'DESKTOP',
+        platform: '"macOS"',
+        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
+    },
+];
+
 const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
 const DEFAULT_STAY_OFFSET_DAYS = 30;
 const DEFAULT_STAY_LENGTH_DAYS = 1;
-const REQUEST_TIMEOUT_MS = 60000;
 const BOOTSTRAP_RETRYABLE_STATUS_CODES = new Set([403, 408, 425, 429, 500, 502, 503, 504]);
 const BOOTSTRAP_RETRYABLE_ERROR_CODES = new Set(['ECONNRESET', 'EAI_AGAIN', 'ETIMEDOUT', 'UND_ERR_CONNECT_TIMEOUT']);
 const BOOTSTRAP_BASE_BACKOFF_MS = 900;
@@ -27,10 +60,12 @@ const GRAPHQL_BASE_BACKOFF_MS = 1000;
 const GRAPHQL_MAX_BACKOFF_MS = 10000;
 const GRAPHQL_MAX_ATTEMPTS = 3;
 
-const PAGE_REQUEST_DELAY_MIN_MS = 700;
-const PAGE_REQUEST_DELAY_MAX_MS = 1800;
+const PAGE_REQUEST_DELAY_MIN_MS = 1500;
+const PAGE_REQUEST_DELAY_MAX_MS = 4000;
 
-const impitClients = new Map();
+function selectRequestProfile(attempt, offset = 0) {
+    return REQUEST_PROFILES[(attempt - 1 + offset) % REQUEST_PROFILES.length];
+}
 
 function cleanText(value) {
     if (value === null || value === undefined) return undefined;
@@ -293,70 +328,20 @@ function parseCookieHeader(setCookieHeaders = []) {
     return setCookieHeaders.map((entry) => entry.split(';')[0]).join('; ');
 }
 
-function hasLocalApifyProxyCredentials() {
-    return Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
-}
-
-function shouldUseLocalPreview(proxyInput) {
-    if (Actor.isAtHome() || hasLocalApifyProxyCredentials()) return false;
-    const normalizedProxyInput = normalizeProxyConfigurationInput(proxyInput);
-    if (!normalizedProxyInput?.useApifyProxy) return false;
-    return !Array.isArray(normalizedProxyInput.proxyUrls) || normalizedProxyInput.proxyUrls.length === 0;
-}
-
-function buildLocalPreviewRecord({ startUrl }) {
-    const { checkInDate, checkOutDate } = getSafeFutureStayDates();
-
-    return compactObject({
-        hotel_id: 'local-preview',
-        hotel_name: 'Local preview record - proxy required for live Expedia data',
-        city: 'London',
-        star_rating: 4,
-        guest_rating: 8.8,
-        guest_rating_out_of_five: 4.4,
-        review_count: 1284,
-        review_label: 'Excellent',
-        nightly_price: '$125 nightly',
-        total_price: '$149',
-        free_cancellation: true,
-        member_price_available: true,
-        vacation_rental: false,
-        image_url: 'https://images.trvl-media.com/lodging/1000000/10000/100/1/example.jpg',
-        property_url: 'https://www.expedia.com/',
-        region_id: '6139104',
-        region_name: 'London, United Kingdom (LON-All Airports)',
-        check_in: checkInDate,
-        check_out: checkOutDate,
-        adults: 2,
-        children: [],
-        sort: 'RECOMMENDED',
-        search_id: 'local-preview',
-        source_url: startUrl,
-        operation_name: PROPERTY_LISTING_QUERY.operationName,
-        scraped_at: new Date().toISOString(),
-    });
-}
-
-function getImpitClient(proxyUrl) {
-    const key = proxyUrl || 'direct';
-    if (!impitClients.has(key)) {
-        impitClients.set(key, new Impit({
-            browser: 'chrome',
-            ignoreTlsErrors: true,
-            ...(proxyUrl && { proxyUrl }),
-        }));
+function mergeCookieHeaders(existingCookieHeader, setCookieHeaders = []) {
+    const cookies = new Map();
+    for (const cookiePair of cleanText(existingCookieHeader)?.split(/;\s*/) || []) {
+        const separatorIndex = cookiePair.indexOf('=');
+        if (separatorIndex > 0) cookies.set(cookiePair.slice(0, separatorIndex), cookiePair.slice(separatorIndex + 1));
     }
 
-    return impitClients.get(key);
-}
+    for (const setCookieHeader of setCookieHeaders) {
+        const cookiePair = cleanText(setCookieHeader)?.split(';')[0];
+        const separatorIndex = cookiePair?.indexOf('=') ?? -1;
+        if (separatorIndex > 0) cookies.set(cookiePair.slice(0, separatorIndex), cookiePair.slice(separatorIndex + 1));
+    }
 
-function getSetCookieHeaders(headers) {
-    if (!headers) return [];
-    if (typeof headers.getSetCookie === 'function') return headers.getSetCookie();
-
-    const value = headers.get?.('set-cookie');
-    if (!value) return [];
-    return Array.isArray(value) ? value : [value];
+    return [...cookies.entries()].map(([key, value]) => `${key}=${value}`).join('; ');
 }
 
 function sleep(milliseconds) {
@@ -539,18 +524,7 @@ async function buildProxyStrategies(proxyInput, startUrl) {
 
     let userProxyConfiguration;
     const normalizedProxyInput = normalizeProxyConfigurationInput(proxyInput);
-    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
-    const hasLocalApifyCredentials = hasLocalApifyProxyCredentials();
-    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
-    const hasCustomProxyUrls = Array.isArray(normalizedProxyInput?.proxyUrls) && normalizedProxyInput.proxyUrls.length > 0;
-    const usesApifyProxy = Boolean(
-        normalizedProxyInput?.useApifyProxy
-        || normalizedProxyInput?.groups
-        || normalizedProxyInput?.apifyProxyGroups,
-    );
-    const canUseInputProxy = normalizedProxyInput && (!usesApifyProxy || hasCustomProxyUrls || shouldTryApifyFallback);
-
-    if (canUseInputProxy) {
+    if (normalizedProxyInput) {
         try {
             userProxyConfiguration = await Actor.createProxyConfiguration(normalizedProxyInput);
             if (userProxyConfiguration) addStrategy('input_proxy_configuration', userProxyConfiguration);
@@ -559,12 +533,13 @@ async function buildProxyStrategies(proxyInput, startUrl) {
                 message: toErrorMessage(error),
             });
         }
-    } else if (normalizedProxyInput) {
-        log.warning('Apify proxy was requested but no local proxy credentials were found. Skipping direct Expedia requests to avoid 429 responses.');
     } else {
         addStrategy('direct_no_proxy', undefined);
     }
 
+    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
+    const hasLocalApifyCredentials = Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
+    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
     const preferredCountryCode = inferPreferredCountryCodeFromStartUrl(startUrl);
     const canUseApifyFallback = !isExplicitlyNoApifyProxy;
 
@@ -592,12 +567,8 @@ async function buildProxyStrategies(proxyInput, startUrl) {
         }
     }
 
-    if (!normalizedProxyInput && !strategies.some((entry) => entry.label === 'direct_no_proxy')) {
+    if (!strategies.some((entry) => entry.label === 'direct_no_proxy')) {
         addStrategy('direct_no_proxy', undefined);
-    }
-
-    if (!strategies.length) {
-        throw new Error('No usable proxy strategy available. Provide APIFY_TOKEN/APIFY_PROXY_PASSWORD locally or run the actor on Apify with proxy access enabled.');
     }
 
     return strategies;
@@ -773,7 +744,7 @@ function buildBootstrapData(html, cookieHeader) {
     };
 }
 
-function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
+function buildRequestPayload({ input, bootstrapData, requestProfile, startIndex, size }) {
     const children = parseChildrenAges(input.children);
 
     return {
@@ -785,7 +756,7 @@ function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
                 eapid: 0,
                 tpid: 1,
                 currency: 'USD',
-                device: { type: 'DESKTOP' },
+                device: { type: requestProfile?.deviceType || 'DESKTOP' },
                 identity: {
                     duaid: bootstrapData.duaid,
                     authState: 'ANONYMOUS',
@@ -945,24 +916,62 @@ async function loadInput() {
     return {};
 }
 
-async function fetchSearchPage({ searchUrl, proxyUrl }) {
-    const response = await getImpitClient(proxyUrl).fetch(searchUrl, {
-        redirect: 'follow',
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-    });
+function getProfileHeaders(requestProfile, target) {
+    const isMobile = requestProfile.deviceType === 'MOBILE';
+    const headers = {
+        'user-agent': requestProfile.userAgent,
+        'accept-language': 'en-US,en;q=0.9',
+    };
 
-    if (response.status < 200 || response.status >= 400) {
-        throw createHttpStatusError(`Search page request failed with status ${response.status}`, response.status);
+    if (requestProfile.secChUa) {
+        headers['sec-ch-ua'] = requestProfile.secChUa;
+        headers['sec-ch-ua-mobile'] = isMobile ? '?1' : '?0';
+        headers['sec-ch-ua-platform'] = requestProfile.platform || (isMobile ? '"Android"' : '"Windows"');
+    }
+
+    if (target === 'document') {
+        return {
+            ...headers,
+            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'cache-control': 'max-age=0',
+            pragma: 'no-cache',
+            'upgrade-insecure-requests': '1',
+            'sec-fetch-dest': 'document',
+            'sec-fetch-mode': 'navigate',
+            'sec-fetch-site': 'none',
+            'sec-fetch-user': '?1',
+        };
     }
 
     return {
-        body: await response.text(),
-        headers: {
-            'set-cookie': getSetCookieHeaders(response.headers),
-        },
-        statusCode: response.status,
-        url: response.url,
+        ...headers,
+        accept: 'application/json, text/plain, */*',
+        'accept-encoding': 'gzip, deflate, br',
+        'cache-control': 'no-cache',
+        'content-type': 'application/json',
+        te: 'trailers',
+        'sec-fetch-dest': 'empty',
+        'sec-fetch-mode': 'cors',
+        'sec-fetch-site': 'same-origin',
     };
+}
+
+async function fetchSearchPage({ searchUrl, requestProfile, proxyUrl }) {
+    const response = await gotScraping({
+        url: searchUrl,
+        headers: getProfileHeaders(requestProfile, 'document'),
+        proxyUrl,
+        retry: { limit: 0 },
+        timeout: { request: 60000 },
+        throwHttpErrors: false,
+        useHeaderGenerator: false,
+    });
+
+    if (response.statusCode < 200 || response.statusCode >= 400) {
+        throw createHttpStatusError(`Search page request failed with status ${response.statusCode}`, response.statusCode);
+    }
+
+    return response;
 }
 
 async function loadApiDiscoveryOverrides() {
@@ -984,13 +993,15 @@ async function loadApiDiscoveryOverrides() {
 
 async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) {
     let lastError;
+    const suppressedFailures = [];
 
-    for (const strategy of proxyStrategies) {
+    for (const [strategyIndex, strategy] of proxyStrategies.entries()) {
         const hasProxy = Boolean(strategy.proxyConfiguration);
         const maxAttempts = hasProxy ? BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY : BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY;
         let abortStrategy = false;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+            const requestProfile = selectRequestProfile(attempt, strategyIndex);
             let proxyUrl;
 
             if (strategy.proxyConfiguration) {
@@ -1010,14 +1021,23 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
 
             for (const [candidateIndex, searchUrl] of searchUrlCandidates.entries()) {
                 try {
-                    const pageResponse = await fetchSearchPage({ searchUrl, proxyUrl });
+                    const pageResponse = await fetchSearchPage({ searchUrl, requestProfile, proxyUrl });
                     const html = String(pageResponse.body || '');
                     const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
                     const bootstrapData = buildBootstrapData(html, cookieHeader);
 
+                    if (suppressedFailures.length) {
+                        log.info('Recovered Expedia bootstrap session after rotating proxy/profile.', {
+                            suppressedFailures: suppressedFailures.length,
+                            proxyStrategy: strategy.label,
+                            requestProfile: requestProfile.name,
+                        });
+                    }
+
                     return {
                         pageResponse,
                         searchUrl,
+                        requestProfile,
                         proxyUrl,
                         cookieHeader,
                         bootstrapData,
@@ -1029,28 +1049,23 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     const retryable = isBootstrapRetryableError(error);
                     const abandonStrategyEarly = shouldAbandonBootstrapStrategy({ error, attempt, hasProxy });
                     const skipRemainingSearchUrls = shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
+                    suppressedFailures.push({
+                        strategy: strategy.label,
+                        profile: requestProfile.name,
+                        attempt,
+                        statusCode,
+                        message: toErrorMessage(error),
+                    });
 
                     if (abandonStrategyEarly) {
                         abortStrategy = true;
-                        log.debug('Bootstrap strategy abandoned after repeated blocking responses.', {
-                            strategy: strategy.label,
-                            attempt,
-                            statusCode,
-                            message: toErrorMessage(error),
-                        });
                         break;
                     }
 
                     if (retryable) {
-                        log.debug('Bootstrap attempt failed, retrying.', {
-                            strategy: strategy.label,
-                            attempt,
-                            statusCode,
-                            message: toErrorMessage(error),
-                        });
                         await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
                     } else {
-                        log.debug('Bootstrap failed with non-retryable error.', {
+                        log.warning('Bootstrap failed with non-retryable error.', {
                             strategy: strategy.label,
                             attempt,
                             statusCode,
@@ -1069,6 +1084,14 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     }
 
     const statusCode = getErrorStatusCode(lastError);
+    if (suppressedFailures.length) {
+        log.warning('Expedia bootstrap failed after rotating all proxy/profile candidates.', {
+            suppressedFailures: suppressedFailures.length,
+            lastStatusCode: statusCode,
+            lastMessage: toErrorMessage(lastError),
+        });
+    }
+
     if (statusCode === 429) {
         throw new Error('Could not initialize Expedia search session from startUrl. Expedia returned anti-bot 429/challenge responses. Enable Apify residential proxy in proxyConfiguration and retry.');
     }
@@ -1076,10 +1099,10 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
 }
 
-async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
+async function fetchListingBatch({ graphQlUrl, searchUrl, requestProfile, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
     return retryWithBackoff(async () => {
         const headers = {
-            'content-type': 'application/json',
+            ...getProfileHeaders(requestProfile, 'api'),
             'client-info': bootstrapData.clientInfo,
             'x-page-id': bootstrapData.pageId,
             'x-enable-apq': 'true',
@@ -1090,33 +1113,36 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, cookieHeader
             cookie: cookieHeader,
         };
 
-        const response = await getImpitClient(proxyUrl).fetch(graphQlUrl, {
+        const response = await gotScraping({
+            url: graphQlUrl,
             method: 'POST',
             headers,
-            body: JSON.stringify([payload]),
-            redirect: 'follow',
-            signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+            json: [payload],
+            responseType: 'json',
+            proxyUrl,
+            retry: { limit: 0 },
+            timeout: { request: 60000 },
+            throwHttpErrors: false,
+            useHeaderGenerator: false,
         });
 
-        const setCookieHeaders = getSetCookieHeaders(response.headers);
-        if (cookieState && setCookieHeaders.length) {
+        if (cookieState && response.headers['set-cookie']) {
             // eslint-disable-next-line no-param-reassign
-            cookieState.cookieHeader = parseCookieHeader(setCookieHeaders);
+            cookieState.cookieHeader = mergeCookieHeaders(cookieState.cookieHeader, response.headers['set-cookie']);
         }
 
-        const responseBody = await response.text();
-        if (response.status < 200 || response.status >= 400) {
-            const error = new Error(`PropertyListingQuery failed with status ${response.status}: ${responseBody.slice(0, 300)}`);
-            error.statusCode = response.status;
+        if (response.statusCode < 200 || response.statusCode >= 400) {
+            const errorBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
+            const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${errorBody.slice(0, 300)}`);
+            error.statusCode = response.statusCode;
             throw error;
         }
 
-        const parsedBody = JSON.parse(responseBody);
-        const result = Array.isArray(parsedBody) ? parsedBody[0] : parsedBody;
+        const result = Array.isArray(response.body) ? response.body[0] : response.body;
         const hasErrors = Array.isArray(result?.errors) && result.errors.length;
         if (hasErrors) {
             const messages = result.errors.map((entry) => entry.message).filter(Boolean);
-            const isFatal = messages.some((m) => /not found|unauthorized|forbidden/i.test(m));
+            const isFatal = messages.some((m) => /persistedquerynotfound|not found|unauthorized|forbidden/i.test(m));
             if (isFatal) throw new Error(messages.join('; '));
             log.warning('GraphQL response contained non-fatal errors, continuing with partial data.', {
                 errors: messages.join('; '),
@@ -1166,19 +1192,8 @@ async function main() {
         throw new Error('Could not normalize startUrl into a valid Expedia URL.');
     }
 
-    if (shouldUseLocalPreview(proxyInput)) {
-        log.warning('Local Apify proxy credentials are missing. Writing a preview dataset item instead of sending direct Expedia requests that return 429.');
-        await Actor.pushData(buildLocalPreviewRecord({ startUrl }));
-        log.info('Finished local preview run', {
-            saved: 1,
-            requested: resultsWanted,
-            liveExtraction: false,
-        });
-        return;
-    }
-
     const proxyStrategies = await buildProxyStrategies(proxyInput, startUrl);
-    log.debug('Prepared proxy recovery strategies.', {
+    log.info('Prepared proxy recovery strategies.', {
         strategies: proxyStrategies.map((entry) => entry.label),
     });
     const scrapedAt = new Date().toISOString();
@@ -1201,6 +1216,7 @@ async function main() {
         maxPages,
         usingProxy: Boolean(searchSession.proxyUrl),
         proxyStrategy: searchSession.proxyStrategy,
+        requestProfile: searchSession.requestProfile.name,
     });
 
     const seenHotelIds = new Set();
@@ -1213,6 +1229,7 @@ async function main() {
         let payload = buildRequestPayload({
             input: normalizedInput,
             bootstrapData: searchSession.bootstrapData,
+            requestProfile: searchSession.requestProfile,
             startIndex,
             size: batchSize,
         });
@@ -1222,6 +1239,7 @@ async function main() {
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
+                requestProfile: searchSession.requestProfile,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
@@ -1250,12 +1268,14 @@ async function main() {
             payload = buildRequestPayload({
                 input: normalizedInput,
                 bootstrapData: searchSession.bootstrapData,
+                requestProfile: searchSession.requestProfile,
                 startIndex,
                 size: batchSize,
             });
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
+                requestProfile: searchSession.requestProfile,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
@@ -1274,6 +1294,7 @@ async function main() {
 
         if (!cards.length) break;
 
+        const pageRecords = [];
         for (const card of cards) {
             if (records.length >= resultsWanted) break;
 
@@ -1292,6 +1313,7 @@ async function main() {
 
                 seenHotelIds.add(record.hotel_id);
                 records.push(record);
+                pageRecords.push(record);
             } catch (error) {
                 log.warning('Skipped hotel card due to processing error.', {
                     hotelId: cleanText(card?.id),
@@ -1300,7 +1322,13 @@ async function main() {
             }
         }
 
-        log.info(`Saved ${records.length}/${resultsWanted} hotel listings after page ${pageNumber}`);
+        if (pageRecords.length) {
+            await Dataset.pushData(pageRecords);
+        }
+
+        log.info(`Saved ${records.length}/${resultsWanted} hotel listings after page ${pageNumber}`, {
+            batchSaved: pageRecords.length,
+        });
 
         if (cards.length < batchSize) break;
         startIndex += batchSize;
@@ -1314,8 +1342,6 @@ async function main() {
     if (!records.length) {
         throw new Error('No hotel listings extracted. Verify the Expedia Hotel-Search URL or use residential proxies if the endpoint is blocked.');
     }
-
-    await Actor.pushData(records);
 
     log.info('Finished successfully', {
         saved: records.length,
