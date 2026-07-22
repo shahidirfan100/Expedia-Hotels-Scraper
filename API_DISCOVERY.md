@@ -21,11 +21,35 @@
 ## Request Profile Matrix
 | Candidate | Header profile | Use | Decision |
 |---|---|---|---|
-| Web GraphQL | Desktop Chrome headers + matching sec-ch-ua | First bootstrap/API replay attempt | selected primary |
-| Web GraphQL | Android Chrome mobile web headers + matching MOBILE device context | Early fallback when desktop profile is blocked | selected fallback |
-| Web GraphQL | Firefox desktop headers without Chromium client hints | Additional fallback when Chrome profile is blocked | selected fallback |
-| Web GraphQL | iOS Safari mobile web headers without Chromium client hints | Later fallback when Chromium-style profiles are blocked | selected fallback |
+| Web GraphQL | iOS Safari navigation warmup + same warmed cookies for GraphQL | Selected hotel-listing request pattern | selected primary |
+| Web GraphQL | Desktop Chrome headers + matching sec-ch-ua | Older bootstrap/API replay attempt | rejected because mixing Chromium hints with Safari fallback cookies caused inconsistent sessions |
+| Web GraphQL | Android Chrome mobile web headers + matching MOBILE device context | Older fallback when desktop profile was blocked | rejected for current listing actor because request context remains DESKTOP |
 | Android app style | okhttp-style app headers | Not used against web Hotel-Search/bootstrap flow because Expedia web GraphQL needs browser cookies/page state | rejected for runtime |
+
+## Rotating Hotel Listing Warmup Ladder (July 22, 2026)
+
+Selected sequence for Expedia hotel listing sessions:
+1. GET `https://www.expedia.com/`
+2. GET the clean canonical Hotel-Search/listing URL first.
+3. If needed, retry with the full original Hotel-Search/listing URL on the next fresh session.
+4. POST `PropertyListingQuery` to `https://www.expedia.com/graphql` with warmed cookies, `DUAID` as `device-user-agent-id`, `origin: https://www.expedia.com`, listing URL as `referer`, warmed `x-page-id`/`client-info` when present, and DESKTOP request context.
+
+Warmup profiles rotate per attempt and then cycle:
+
+| Attempt | Profile | Transport | Extra navigation headers | Candidate result |
+|---:|---|---|---|---|
+| 1 | `ios-safari-standard` | impit Chrome | none | successful if homepage and listing return a real 2xx/3xx Expedia page with cookies |
+| 2 | `ios-safari-firefox-transport` | impit Firefox | none | successful if Firefox TLS transport gets a valid listing session |
+| 3 | `ios-safari-cache-control` | impit Chrome | `cache-control`, `pragma`, `upgrade-insecure-requests`, `priority` | successful if no-cache navigation avoids stale challenge sessions |
+| 4 | `ios-safari-firefox-cache-control` | impit Firefox | `cache-control`, `pragma`, `upgrade-insecure-requests`, `priority` | successful if Firefox transport plus no-cache navigation gets a valid listing session |
+| Any | any profile | any | any | rejected when status is 429 and `x-page-id` is `wildcard-challenge-handler` |
+
+Implementation notes:
+- `impit` clients are cached by both browser transport and proxy URL, for example `${browser}:${proxyUrl || '__direct__'}`.
+- Residential proxy warmup allows 8 attempts; direct/no-proxy warmup allows 2 attempts.
+- Each residential retry uses a fresh Apify proxy session id shaped as `expedia_${uuidWithoutHyphens}` to satisfy Apify session id rules.
+- Challenge cookies from homepage, listing, or GraphQL responses are discarded immediately and are not sent to data requests.
+- Residential proxy exhaustion fails the actor clearly. Direct/no-proxy challenge exits cleanly with a residential proxy recommendation.
 
 ## Selected Response Fields
 - hotel_id
