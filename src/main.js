@@ -1,7 +1,8 @@
 import { readFile } from 'node:fs/promises';
 
 import { Actor, log } from 'apify';
-import { Dataset, gotScraping } from 'crawlee';
+import { Dataset } from 'crawlee';
+import { Impit } from 'impit';
 
 await Actor.init();
 
@@ -10,39 +11,13 @@ const PROPERTY_LISTING_QUERY = {
     hash: '82abb7da6738db4c904e4d10130072236a751b5a315f6dfaf92474793597bc33',
 };
 
-const REQUEST_PROFILES = [
-    {
-        name: 'chrome_windows',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        deviceType: 'DESKTOP',
-        platform: '"Windows"',
-        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
-    },
-    {
-        name: 'android_chrome',
-        userAgent: 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36',
-        deviceType: 'MOBILE',
-        platform: '"Android"',
-        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
-    },
-    {
-        name: 'firefox_windows',
-        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:147.0) Gecko/20100101 Firefox/147.0',
-        deviceType: 'DESKTOP',
-    },
-    {
-        name: 'ios_safari',
-        userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
-        deviceType: 'MOBILE',
-    },
-    {
-        name: 'chrome_macos',
-        userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 15_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
-        deviceType: 'DESKTOP',
-        platform: '"macOS"',
-        secChUa: '"Not/A)Brand";v="99", "Google Chrome";v="126", "Chromium";v="126"',
-    },
-];
+const HOME_URL = 'https://www.expedia.com/';
+const IOS_SAFARI_WARMUP_PROFILE = {
+    name: 'ios_safari',
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+};
+const HOTEL_LISTING_PAGE_ID_FALLBACK = 'page.Hotel-Search,H,20';
+const HOTEL_LISTING_CLIENT_INFO_FALLBACK = 'shopping-pwa,unknown,us-east-1';
 
 const EXPEDIA_HOST_PATTERN = /(^|\.)expedia\.[a-z.]+$/i;
 const DEFAULT_STAY_OFFSET_DAYS = 30;
@@ -63,9 +38,7 @@ const GRAPHQL_MAX_ATTEMPTS = 3;
 const PAGE_REQUEST_DELAY_MIN_MS = 1500;
 const PAGE_REQUEST_DELAY_MAX_MS = 4000;
 
-function selectRequestProfile(attempt, offset = 0) {
-    return REQUEST_PROFILES[(attempt - 1 + offset) % REQUEST_PROFILES.length];
-}
+const impitInstances = new Map();
 
 function cleanText(value) {
     if (value === null || value === undefined) return undefined;
@@ -324,24 +297,96 @@ function normalizeResourceUrl(resource) {
     }
 }
 
-function parseCookieHeader(setCookieHeaders = []) {
-    return setCookieHeaders.map((entry) => entry.split(';')[0]).join('; ');
+function mergeCookieHeaderStrings(existing, fresh) {
+    if (!fresh) return existing;
+    const cookies = new Map();
+    for (const cookieHeader of [existing, fresh]) {
+        for (const cookiePair of cleanText(cookieHeader)?.split(/;\s*/) || []) {
+            const separatorIndex = cookiePair.indexOf('=');
+            if (separatorIndex > 0) cookies.set(cookiePair.slice(0, separatorIndex), cookiePair.slice(separatorIndex + 1));
+        }
+    }
+    return [...cookies.entries()].map(([key, value]) => `${key}=${value}`).join('; ');
 }
 
-function mergeCookieHeaders(existingCookieHeader, setCookieHeaders = []) {
-    const cookies = new Map();
-    for (const cookiePair of cleanText(existingCookieHeader)?.split(/;\s*/) || []) {
-        const separatorIndex = cookiePair.indexOf('=');
-        if (separatorIndex > 0) cookies.set(cookiePair.slice(0, separatorIndex), cookiePair.slice(separatorIndex + 1));
+function extractCookiesFromHeaders(headers) {
+    if (!headers) return undefined;
+    const rawSetCookie = [];
+    try {
+        if (typeof headers.getSetCookie === 'function') {
+            rawSetCookie.push(...headers.getSetCookie());
+        }
+        if (!rawSetCookie.length && typeof headers.forEach === 'function') {
+            headers.forEach((value, key) => {
+                if (String(key).toLowerCase() === 'set-cookie') rawSetCookie.push(value);
+            });
+        }
+        if (!rawSetCookie.length && typeof headers === 'object') {
+            const raw = headers['set-cookie'] || headers['Set-Cookie'];
+            if (Array.isArray(raw)) rawSetCookie.push(...raw);
+            else if (typeof raw === 'string') rawSetCookie.push(raw);
+        }
+    } catch {
+        // Ignore malformed header containers.
     }
 
-    for (const setCookieHeader of setCookieHeaders) {
-        const cookiePair = cleanText(setCookieHeader)?.split(';')[0];
-        const separatorIndex = cookiePair?.indexOf('=') ?? -1;
-        if (separatorIndex > 0) cookies.set(cookiePair.slice(0, separatorIndex), cookiePair.slice(separatorIndex + 1));
+    const cookieParts = rawSetCookie
+        .map((cookie) => cleanText(String(cookie).split(';')[0]))
+        .filter(Boolean);
+
+    return cookieParts.length ? cookieParts.join('; ') : undefined;
+}
+
+function getHeaderValue(headers, name) {
+    if (!headers) return undefined;
+    if (typeof headers.get === 'function') return cleanText(headers.get(name));
+    return cleanText(headers[name] || headers[name.toLowerCase()]);
+}
+
+function getCookieValue(cookieHeader, name) {
+    const target = cleanText(name);
+    if (!cookieHeader || !target) return undefined;
+
+    for (const part of String(cookieHeader).split(';').map((entry) => entry.trim()).filter(Boolean)) {
+        const separatorIndex = part.indexOf('=');
+        if (separatorIndex === -1) continue;
+        if (part.slice(0, separatorIndex) === target) return part.slice(separatorIndex + 1);
     }
 
-    return [...cookies.entries()].map(([key, value]) => `${key}=${value}`).join('; ');
+    return undefined;
+}
+
+function getImpit(proxyUrl) {
+    const key = proxyUrl || '__direct__';
+    if (impitInstances.has(key)) return impitInstances.get(key);
+
+    const impit = new Impit({
+        browser: 'chrome',
+        ignoreTlsErrors: true,
+        ...(proxyUrl && { proxyUrl }),
+    });
+    impitInstances.set(key, impit);
+    return impit;
+}
+
+async function makeImpitRequest({ url, method = 'GET', headers, body, proxyUrl, timeout = 60_000 }) {
+    const impit = getImpit(proxyUrl);
+    const init = {
+        method,
+        headers,
+        signal: AbortSignal.timeout(timeout),
+    };
+    if (body !== undefined) init.body = body;
+
+    const response = await impit.fetch(url, init);
+    const bodyText = await response.text().catch(() => '');
+
+    return {
+        statusCode: response.status,
+        url: response.url || url,
+        headers: response.headers,
+        body: bodyText,
+    };
 }
 
 function sleep(milliseconds) {
@@ -389,6 +434,8 @@ async function retryWithBackoff(fn, options = {}) {
         try {
             return await fn(attempt);
         } catch (error) {
+            if (error?.challengeSession || error?.rateLimitedSession) throw error;
+
             lastError = error;
             const statusCode = getErrorStatusCode(error);
             const isRetryable = statusCode
@@ -495,25 +542,7 @@ function normalizeProxyConfigurationInput(proxyInput) {
     return normalized;
 }
 
-function inferPreferredCountryCodeFromStartUrl(startUrl) {
-    const parsed = parseStartUrlSearchInput(startUrl);
-    const destination = cleanText(parsed.destination)?.toLowerCase() || '';
-
-    if (/united kingdom|\buk\b|england|london|scotland|wales|northern ireland/.test(destination)) return 'GB';
-    if (/united states|\busa\b|new york|los angeles|chicago|miami/.test(destination)) return 'US';
-    if (/canada|toronto|vancouver|montreal/.test(destination)) return 'CA';
-    if (/australia|sydney|melbourne|brisbane/.test(destination)) return 'AU';
-    if (/india|delhi|mumbai|bangalore/.test(destination)) return 'IN';
-    if (/pakistan|karachi|lahore|islamabad/.test(destination)) return 'PK';
-    if (/germany|berlin|munich|frankfurt/.test(destination)) return 'DE';
-    if (/france|paris|lyon|marseille/.test(destination)) return 'FR';
-    if (/italy|rome|milan|florence/.test(destination)) return 'IT';
-    if (/spain|madrid|barcelona|valencia/.test(destination)) return 'ES';
-
-    return undefined;
-}
-
-async function buildProxyStrategies(proxyInput, startUrl) {
+async function buildProxyStrategies(proxyInput) {
     const strategies = [];
     const usedLabels = new Set();
     const addStrategy = (label, proxyConfiguration) => {
@@ -532,38 +561,6 @@ async function buildProxyStrategies(proxyInput, startUrl) {
             log.warning('Proxy configuration initialization failed, continuing with fallback strategies.', {
                 message: toErrorMessage(error),
             });
-        }
-    } else {
-        addStrategy('direct_no_proxy', undefined);
-    }
-
-    const isExplicitlyNoApifyProxy = normalizedProxyInput?.useApifyProxy === false;
-    const hasLocalApifyCredentials = Boolean(process.env.APIFY_TOKEN || process.env.APIFY_PROXY_PASSWORD);
-    const shouldTryApifyFallback = Actor.isAtHome() || hasLocalApifyCredentials;
-    const preferredCountryCode = inferPreferredCountryCodeFromStartUrl(startUrl);
-    const canUseApifyFallback = !isExplicitlyNoApifyProxy;
-
-    if (canUseApifyFallback && shouldTryApifyFallback) {
-        const fallbackConfigs = [
-            ...(preferredCountryCode ? [{
-                label: `auto_residential_${preferredCountryCode.toLowerCase()}`,
-                options: { useApifyProxy: true, groups: ['RESIDENTIAL'], countryCode: preferredCountryCode },
-            }] : []),
-            { label: 'auto_residential_us', options: { useApifyProxy: true, groups: ['RESIDENTIAL'], countryCode: 'US' } },
-            { label: 'auto_residential_any', options: { useApifyProxy: true, groups: ['RESIDENTIAL'] } },
-            { label: 'auto_apify_proxy', options: { useApifyProxy: true } },
-        ];
-
-        for (const fallback of fallbackConfigs) {
-            try {
-                const proxyConfiguration = await Actor.createProxyConfiguration(fallback.options);
-                if (proxyConfiguration) addStrategy(fallback.label, proxyConfiguration);
-            } catch (error) {
-                log.warning('Could not initialize proxy fallback strategy.', {
-                    strategy: fallback.label,
-                    message: toErrorMessage(error),
-                });
-            }
         }
     }
 
@@ -715,7 +712,7 @@ function buildBootstrapData(html, cookieHeader) {
     const pageId = extractMatch(normalizedHtml, /"pageId":"([^"]+)"/);
     const searchId = extractMatch(normalizedHtml, /"searchId":"([^"]+)"/);
     const productOffersId = extractMatch(normalizedHtml, /"productOffersId":"([^"]+)"/);
-    const duaid = extractMatch(cookieHeader, /(?:^|;\s*)DUAID=([^;]+)/);
+    const duaid = getCookieValue(cookieHeader, 'DUAID');
     const resultsStartingIndex = toInteger(extractMatch(normalizedHtml, /"resultsStartingIndex":(\d+)/));
     const resultsSize = toInteger(extractMatch(normalizedHtml, /"resultsSize":(\d+)/));
 
@@ -733,8 +730,8 @@ function buildBootstrapData(html, cookieHeader) {
     }
 
     return {
-        clientInfo: `${applicationName},${applicationVersion},${awsRegion}`,
-        pageId,
+        clientInfo: normalizeHotelClientInfo(`${applicationName},${applicationVersion},${awsRegion}`),
+        pageId: normalizeHotelPageId(pageId),
         searchId,
         productOffersId,
         duaid,
@@ -744,7 +741,41 @@ function buildBootstrapData(html, cookieHeader) {
     };
 }
 
-function buildRequestPayload({ input, bootstrapData, requestProfile, startIndex, size }) {
+function normalizeHotelPageId(value) {
+    const pageId = cleanText(value);
+    return pageId && pageId !== 'wildcard-challenge-handler' && /^page\.Hotel-Search\b/.test(pageId)
+        ? pageId
+        : HOTEL_LISTING_PAGE_ID_FALLBACK;
+}
+
+function getValidHotelPageId(value) {
+    const pageId = cleanText(value);
+    return pageId && pageId !== 'wildcard-challenge-handler' && /^page\.Hotel-Search\b/.test(pageId)
+        ? pageId
+        : undefined;
+}
+
+function normalizeHotelClientInfo(value) {
+    const raw = cleanText(value);
+    if (!raw || /captcha|challenge/i.test(raw)) return HOTEL_LISTING_CLIENT_INFO_FALLBACK;
+
+    const parts = raw.split(',').map((part) => cleanText(part)).filter(Boolean);
+    if (parts.length >= 3) return parts.slice(0, 3).join(',');
+    if (parts.length >= 2) return `${parts[0]},${parts[1]},us-east-1`;
+    return HOTEL_LISTING_CLIENT_INFO_FALLBACK;
+}
+
+function getValidHotelClientInfo(value) {
+    const raw = cleanText(value);
+    if (!raw || /captcha|challenge/i.test(raw)) return undefined;
+
+    const parts = raw.split(',').map((part) => cleanText(part)).filter(Boolean);
+    if (parts.length >= 3) return parts.slice(0, 3).join(',');
+    if (parts.length >= 2) return `${parts[0]},${parts[1]},us-east-1`;
+    return undefined;
+}
+
+function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
     const children = parseChildrenAges(input.children);
 
     return {
@@ -756,7 +787,7 @@ function buildRequestPayload({ input, bootstrapData, requestProfile, startIndex,
                 eapid: 0,
                 tpid: 1,
                 currency: 'USD',
-                device: { type: requestProfile?.deviceType || 'DESKTOP' },
+                device: { type: 'DESKTOP' },
                 identity: {
                     duaid: bootstrapData.duaid,
                     authState: 'ANONYMOUS',
@@ -916,62 +947,85 @@ async function loadInput() {
     return {};
 }
 
-function getProfileHeaders(requestProfile, target) {
-    const isMobile = requestProfile.deviceType === 'MOBILE';
-    const headers = {
-        'user-agent': requestProfile.userAgent,
-        'accept-language': 'en-US,en;q=0.9',
-    };
-
-    if (requestProfile.secChUa) {
-        headers['sec-ch-ua'] = requestProfile.secChUa;
-        headers['sec-ch-ua-mobile'] = isMobile ? '?1' : '?0';
-        headers['sec-ch-ua-platform'] = requestProfile.platform || (isMobile ? '"Android"' : '"Windows"');
-    }
-
-    if (target === 'document') {
-        return {
-            ...headers,
-            accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'cache-control': 'max-age=0',
-            pragma: 'no-cache',
-            'upgrade-insecure-requests': '1',
-            'sec-fetch-dest': 'document',
-            'sec-fetch-mode': 'navigate',
-            'sec-fetch-site': 'none',
-            'sec-fetch-user': '?1',
-        };
-    }
-
+function buildWarmupHeaders({ referer } = {}) {
     return {
-        ...headers,
+        'user-agent': IOS_SAFARI_WARMUP_PROFILE.userAgent,
+        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'accept-language': 'en-US,en;q=0.9',
+        'sec-fetch-site': referer ? 'same-origin' : 'none',
+        'sec-fetch-mode': 'navigate',
+        'sec-fetch-user': '?1',
+        'sec-fetch-dest': 'document',
+        'client-info': 'domain-redirect:true',
+        ...(referer ? { referer } : {}),
+    };
+}
+
+function buildGraphqlHeaders({ searchUrl, cookieHeader, bootstrapData }) {
+    return {
+        'user-agent': IOS_SAFARI_WARMUP_PROFILE.userAgent,
         accept: 'application/json, text/plain, */*',
-        'accept-encoding': 'gzip, deflate, br',
-        'cache-control': 'no-cache',
+        'accept-language': 'en-US,en;q=0.9',
         'content-type': 'application/json',
-        te: 'trailers',
+        'client-info': bootstrapData.clientInfo,
+        'device-user-agent-id': bootstrapData.duaid,
+        'x-page-id': bootstrapData.pageId,
+        'x-enable-apq': 'true',
+        'x-shopping-product-line': 'lodging',
+        'ctx-view-id': bootstrapData.ctxViewId,
+        origin: 'https://www.expedia.com',
+        referer: searchUrl,
+        ...(cookieHeader ? { cookie: cookieHeader } : {}),
         'sec-fetch-dest': 'empty',
         'sec-fetch-mode': 'cors',
         'sec-fetch-site': 'same-origin',
     };
 }
 
-async function fetchSearchPage({ searchUrl, requestProfile, proxyUrl }) {
-    const response = await gotScraping({
-        url: searchUrl,
-        headers: getProfileHeaders(requestProfile, 'document'),
+async function fetchSearchPage({ searchUrl, proxyUrl }) {
+    const homeResponse = await makeImpitRequest({
+        url: HOME_URL,
+        method: 'GET',
+        headers: buildWarmupHeaders(),
         proxyUrl,
-        retry: { limit: 0 },
-        timeout: { request: 60000 },
-        throwHttpErrors: false,
-        useHeaderGenerator: false,
+        timeout: 30_000,
+    });
+    let cookieHeader = extractCookiesFromHeaders(homeResponse.headers);
+
+    const listingResponse = await makeImpitRequest({
+        url: searchUrl,
+        method: 'GET',
+        headers: {
+            ...buildWarmupHeaders({ referer: HOME_URL }),
+            ...(cookieHeader ? { cookie: cookieHeader } : {}),
+        },
+        proxyUrl,
+        timeout: 30_000,
+    });
+    cookieHeader = mergeCookieHeaderStrings(cookieHeader, extractCookiesFromHeaders(listingResponse.headers));
+
+    const homePageId = getHeaderValue(homeResponse.headers, 'x-page-id');
+    const listingPageId = getHeaderValue(listingResponse.headers, 'x-page-id');
+    log.info('Expedia hotel warmup completed', {
+        homeStatusCode: homeResponse.statusCode,
+        listingStatusCode: listingResponse.statusCode,
+        hasCookies: Boolean(cookieHeader),
     });
 
-    if (response.statusCode < 200 || response.statusCode >= 400) {
-        throw createHttpStatusError(`Search page request failed with status ${response.statusCode}`, response.statusCode);
+    const isChallengeSession = (homeResponse.statusCode === 429 && homePageId === 'wildcard-challenge-handler')
+        || (listingResponse.statusCode === 429 && listingPageId === 'wildcard-challenge-handler');
+    if (isChallengeSession) {
+        throw createHttpStatusError('Expedia warmup returned a 429 wildcard challenge session.', 429);
     }
 
-    return response;
+    if (listingResponse.statusCode !== 200 || listingPageId === 'wildcard-challenge-handler') {
+        throw createHttpStatusError(`Search page request failed with status ${listingResponse.statusCode}`, listingResponse.statusCode);
+    }
+
+    listingResponse.cookieHeader = cookieHeader;
+    listingResponse.headerPageId = getValidHotelPageId(listingPageId);
+    listingResponse.headerClientInfo = getValidHotelClientInfo(getHeaderValue(listingResponse.headers, 'x-app-info'));
+    return listingResponse;
 }
 
 async function loadApiDiscoveryOverrides() {
@@ -995,13 +1049,12 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     let lastError;
     const suppressedFailures = [];
 
-    for (const [strategyIndex, strategy] of proxyStrategies.entries()) {
+    for (const strategy of proxyStrategies) {
         const hasProxy = Boolean(strategy.proxyConfiguration);
         const maxAttempts = hasProxy ? BOOTSTRAP_MAX_ATTEMPTS_WITH_PROXY : BOOTSTRAP_MAX_ATTEMPTS_WITHOUT_PROXY;
         let abortStrategy = false;
 
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-            const requestProfile = selectRequestProfile(attempt, strategyIndex);
             let proxyUrl;
 
             if (strategy.proxyConfiguration) {
@@ -1021,23 +1074,24 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
 
             for (const [candidateIndex, searchUrl] of searchUrlCandidates.entries()) {
                 try {
-                    const pageResponse = await fetchSearchPage({ searchUrl, requestProfile, proxyUrl });
+                    const pageResponse = await fetchSearchPage({ searchUrl, proxyUrl });
+                    const { cookieHeader } = pageResponse;
                     const html = String(pageResponse.body || '');
-                    const cookieHeader = parseCookieHeader(pageResponse.headers['set-cookie'] || []);
                     const bootstrapData = buildBootstrapData(html, cookieHeader);
+                    bootstrapData.pageId = pageResponse.headerPageId || bootstrapData.pageId;
+                    bootstrapData.clientInfo = pageResponse.headerClientInfo || bootstrapData.clientInfo;
 
                     if (suppressedFailures.length) {
                         log.info('Recovered Expedia bootstrap session after rotating proxy/profile.', {
                             suppressedFailures: suppressedFailures.length,
                             proxyStrategy: strategy.label,
-                            requestProfile: requestProfile.name,
+                            warmupProfile: IOS_SAFARI_WARMUP_PROFILE.name,
                         });
                     }
 
                     return {
                         pageResponse,
                         searchUrl,
-                        requestProfile,
                         proxyUrl,
                         cookieHeader,
                         bootstrapData,
@@ -1051,7 +1105,7 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     const skipRemainingSearchUrls = shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
                     suppressedFailures.push({
                         strategy: strategy.label,
-                        profile: requestProfile.name,
+                        profile: IOS_SAFARI_WARMUP_PROFILE.name,
                         attempt,
                         statusCode,
                         message: toErrorMessage(error),
@@ -1099,46 +1153,49 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
 }
 
-async function fetchListingBatch({ graphQlUrl, searchUrl, requestProfile, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
+async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, cookieHeader, bootstrapData, payload, cookieState }) {
     return retryWithBackoff(async () => {
-        const headers = {
-            ...getProfileHeaders(requestProfile, 'api'),
-            'client-info': bootstrapData.clientInfo,
-            'x-page-id': bootstrapData.pageId,
-            'x-enable-apq': 'true',
-            'x-shopping-product-line': 'lodging',
-            'ctx-view-id': bootstrapData.ctxViewId,
-            origin: 'https://www.expedia.com',
-            referer: searchUrl,
-            cookie: cookieHeader,
-        };
-
-        const response = await gotScraping({
+        const response = await makeImpitRequest({
             url: graphQlUrl,
             method: 'POST',
-            headers,
-            json: [payload],
-            responseType: 'json',
+            headers: buildGraphqlHeaders({ searchUrl, cookieHeader, bootstrapData }),
+            body: JSON.stringify([payload]),
             proxyUrl,
-            retry: { limit: 0 },
-            timeout: { request: 60000 },
-            throwHttpErrors: false,
-            useHeaderGenerator: false,
+            timeout: 45_000,
         });
 
-        if (cookieState && response.headers['set-cookie']) {
+        const newCookies = extractCookiesFromHeaders(response.headers);
+        if (cookieState && newCookies) {
             // eslint-disable-next-line no-param-reassign
-            cookieState.cookieHeader = mergeCookieHeaders(cookieState.cookieHeader, response.headers['set-cookie']);
+            cookieState.cookieHeader = mergeCookieHeaderStrings(cookieState.cookieHeader, newCookies);
+        }
+
+        if (response.statusCode === 429 && getHeaderValue(response.headers, 'x-page-id') === 'wildcard-challenge-handler') {
+            const error = createHttpStatusError('PropertyListingQuery received a 429 wildcard challenge session.', 429);
+            error.challengeSession = true;
+            throw error;
+        }
+
+        if (response.statusCode === 429) {
+            const error = createHttpStatusError('PropertyListingQuery received a 429 response; rotating the warmed Expedia session.', 429);
+            error.rateLimitedSession = true;
+            throw error;
         }
 
         if (response.statusCode < 200 || response.statusCode >= 400) {
-            const errorBody = typeof response.body === 'string' ? response.body : JSON.stringify(response.body);
-            const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${errorBody.slice(0, 300)}`);
+            const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}: ${response.body.slice(0, 300)}`);
             error.statusCode = response.statusCode;
             throw error;
         }
 
-        const result = Array.isArray(response.body) ? response.body[0] : response.body;
+        let responseJson;
+        try {
+            responseJson = JSON.parse(response.body);
+        } catch {
+            throw new Error('PropertyListingQuery returned a non-JSON response.');
+        }
+
+        const result = Array.isArray(responseJson) ? responseJson[0] : responseJson;
         const hasErrors = Array.isArray(result?.errors) && result.errors.length;
         if (hasErrors) {
             const messages = result.errors.map((entry) => entry.message).filter(Boolean);
@@ -1192,9 +1249,11 @@ async function main() {
         throw new Error('Could not normalize startUrl into a valid Expedia URL.');
     }
 
-    const proxyStrategies = await buildProxyStrategies(proxyInput, startUrl);
-    log.info('Prepared proxy recovery strategies.', {
-        strategies: proxyStrategies.map((entry) => entry.label),
+    const proxyStrategies = await buildProxyStrategies(proxyInput);
+    const [primaryProxyStrategy, ...fallbackProxyStrategies] = proxyStrategies.map((entry) => entry.label);
+    log.info('Prepared proxy strategy.', {
+        primary: primaryProxyStrategy,
+        fallbacks: fallbackProxyStrategies,
     });
     const scrapedAt = new Date().toISOString();
 
@@ -1216,7 +1275,7 @@ async function main() {
         maxPages,
         usingProxy: Boolean(searchSession.proxyUrl),
         proxyStrategy: searchSession.proxyStrategy,
-        requestProfile: searchSession.requestProfile.name,
+        warmupProfile: IOS_SAFARI_WARMUP_PROFILE.name,
     });
 
     const seenHotelIds = new Set();
@@ -1229,7 +1288,6 @@ async function main() {
         let payload = buildRequestPayload({
             input: normalizedInput,
             bootstrapData: searchSession.bootstrapData,
-            requestProfile: searchSession.requestProfile,
             startIndex,
             size: batchSize,
         });
@@ -1239,7 +1297,6 @@ async function main() {
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
-                requestProfile: searchSession.requestProfile,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
@@ -1268,14 +1325,12 @@ async function main() {
             payload = buildRequestPayload({
                 input: normalizedInput,
                 bootstrapData: searchSession.bootstrapData,
-                requestProfile: searchSession.requestProfile,
                 startIndex,
                 size: batchSize,
             });
             result = await fetchListingBatch({
                 graphQlUrl,
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
-                requestProfile: searchSession.requestProfile,
                 proxyUrl: searchSession.proxyUrl,
                 cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,

@@ -35,7 +35,8 @@
       "description": "Apify proxy is recommended. The actor auto-heals by trying multiple proxy strategies, including residential fallback.",
       "editor": "proxy",
       "default": {
-        "useApifyProxy": true
+        "useApifyProxy": true,
+        "apifyProxyGroups": ["RESIDENTIAL"]
       }
     }
   },
