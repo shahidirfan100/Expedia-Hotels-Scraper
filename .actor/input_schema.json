@@ -36,8 +36,7 @@
       "editor": "proxy",
       "default": {
         "useApifyProxy": true,
-        "apifyProxyGroups": ["RESIDENTIAL"],
-        "apifyProxyCountry": "US"
+        "apifyProxyGroups": ["RESIDENTIAL"]
       }
     }
   },
