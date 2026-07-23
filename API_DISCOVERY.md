@@ -32,20 +32,20 @@ Selected sequence for Expedia hotel listing sessions:
 1. GET `https://www.expedia.com/`
 2. GET the clean canonical Hotel-Search/listing URL first.
 3. If needed, retry with the full original Hotel-Search/listing URL on the next fresh session.
-4. POST `PropertyListingQuery` to `https://www.expedia.com/graphql` with warmed cookies, `DUAID` as `device-user-agent-id`, `origin: https://www.expedia.com`, listing URL as `referer`, warmed `x-page-id`/`client-info` when present, and DESKTOP request context.
+4. POST `PropertyListingQuery` to `https://www.expedia.com/graphql` with warmed cookies, `DUAID` as `device-user-agent-id`, `origin: https://www.expedia.com`, listing URL as `referer`, warmed `x-page-id`/`client-info` when present, `accept: application/json`, and `DESKTOP` device context (required by this GraphQL query regardless of transport level browser profile).
 
 Warmup profiles rotate per attempt and then cycle:
 
-| Attempt | Profile | Transport | Extra navigation headers | Candidate result |
-|---:|---|---|---|---|
-| 1 | `ios-safari-standard` | impit Chrome | none | successful if homepage and listing return a real 2xx/3xx Expedia page with cookies |
-| 2 | `ios-safari-firefox-transport` | impit Firefox | none | successful if Firefox TLS transport gets a valid listing session |
-| 3 | `ios-safari-cache-control` | impit Chrome | `cache-control`, `pragma`, `upgrade-insecure-requests`, `priority` | successful if no-cache navigation avoids stale challenge sessions |
-| 4 | `ios-safari-firefox-cache-control` | impit Firefox | `cache-control`, `pragma`, `upgrade-insecure-requests`, `priority` | successful if Firefox transport plus no-cache navigation gets a valid listing session |
-| Any | any profile | any | any | rejected when status is 429 and `x-page-id` is `wildcard-challenge-handler` |
+| Attempt | Profile | Transport | Notes |
+|---:|---|---|---|
+| 1 | `ios18-safari` | impit ios18 | iOS 18 system TLS fingerprint (matches Safari, Chrome iOS, Firefox iOS — all use NSURLSession). Device context: MOBILE. |
+| 2 | `chrome-desktop` | impit chrome | Chrome desktop TLS fingerprint. Device context: DESKTOP. |
+| Any | any profile | any | rejected when status is 429 and `x-page-id` is `wildcard-challenge-handler` |
 
 Implementation notes:
 - `impit` clients are cached by both browser transport and proxy URL, for example `${browser}:${proxyUrl || '__direct__'}`.
+- Each impit instance has a `tough-cookie` CookieJar for automatic cookie persistence across requests — no manual cookie extraction or merging needed for session continuity.
+- Only app-specific headers are set manually (`content-type`, `client-info`, `x-page-id`, `origin`, `referer`, `device-user-agent-id`, `x-enable-apq`, `x-shopping-product-line`, `ctx-view-id`). All browser fingerprint headers (`user-agent`, `accept`, `accept-language`, `sec-fetch-*`, etc.) are generated automatically by impit for TLS+HTTP consistency.
 - Residential proxy warmup allows 8 attempts; direct/no-proxy warmup allows 2 attempts.
 - Each residential retry uses a fresh Apify proxy session id shaped as `expedia_${uuidWithoutHyphens}` to satisfy Apify session id rules.
 - Challenge cookies from homepage, listing, or GraphQL responses are discarded immediately and are not sent to data requests.

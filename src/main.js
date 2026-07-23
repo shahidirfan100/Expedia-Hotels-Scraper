@@ -3,6 +3,7 @@ import { readFile } from 'node:fs/promises';
 import { Actor, log } from 'apify';
 import { Dataset } from 'crawlee';
 import { Impit } from 'impit';
+import { CookieJar } from 'tough-cookie';
 
 await Actor.init();
 
@@ -12,37 +13,14 @@ const PROPERTY_LISTING_QUERY = {
 };
 
 const HOME_URL = 'https://www.expedia.com/';
-const IOS_SAFARI_USER_AGENT = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1';
 const WARMUP_PROFILES = [
     {
-        name: 'ios-safari-standard',
+        name: 'ios18-safari',
+        browser: 'ios18',
+    },
+    {
+        name: 'chrome-desktop',
         browser: 'chrome',
-        extraHeaders: {},
-    },
-    {
-        name: 'ios-safari-firefox-transport',
-        browser: 'firefox',
-        extraHeaders: {},
-    },
-    {
-        name: 'ios-safari-cache-control',
-        browser: 'chrome',
-        extraHeaders: {
-            'cache-control': 'no-cache',
-            pragma: 'no-cache',
-            'upgrade-insecure-requests': '1',
-            priority: 'u=0, i',
-        },
-    },
-    {
-        name: 'ios-safari-firefox-cache-control',
-        browser: 'firefox',
-        extraHeaders: {
-            'cache-control': 'no-cache',
-            pragma: 'no-cache',
-            'upgrade-insecure-requests': '1',
-            priority: 'u=0, i',
-        },
     },
 ];
 const HOTEL_LISTING_PAGE_ID_FALLBACK = 'page.Hotel-Search,H,20';
@@ -393,9 +371,11 @@ function getImpit(proxyUrl, browser = 'chrome') {
     const key = `${browser}:${proxyUrl || '__direct__'}`;
     if (impitInstances.has(key)) return impitInstances.get(key);
 
+    const cookieJar = new CookieJar();
     const impit = new Impit({
         browser,
         ignoreTlsErrors: true,
+        cookieJar,
         ...(proxyUrl && { proxyUrl }),
     });
     impitInstances.set(key, impit);
@@ -479,7 +459,8 @@ async function retryWithBackoff(fn, options = {}) {
             if (!isRetryable || attempt === maxAttempts) throw error;
 
             const jitter = Math.floor(Math.random() * 500);
-            const delay = Math.min(maxBackoffMs, baseBackoffMs * (2 ** (attempt - 1)) + (statusCode === 429 ? 2000 : 0) + jitter);
+            const retryAfterMs = error?.retryAfterMs;
+            const delay = Math.min(maxBackoffMs, retryAfterMs || (baseBackoffMs * (2 ** (attempt - 1)) + (statusCode === 429 ? 2000 : 0) + jitter));
             log.warning(`${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms`, {
                 statusCode,
                 message: toErrorMessage(error),
@@ -966,26 +947,13 @@ async function loadInput() {
     return {};
 }
 
-function buildWarmupHeaders({ referer, profile = WARMUP_PROFILES[0] } = {}) {
-    return {
-        'user-agent': IOS_SAFARI_USER_AGENT,
-        accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'accept-language': 'en-US,en;q=0.9',
-        'sec-fetch-site': referer ? 'same-origin' : 'none',
-        'sec-fetch-mode': 'navigate',
-        'sec-fetch-user': '?1',
-        'sec-fetch-dest': 'document',
-        'client-info': 'domain-redirect:true',
-        ...profile.extraHeaders,
-        ...(referer ? { referer } : {}),
-    };
+function buildWarmupHeaders({ referer } = {}) {
+    return referer ? { referer } : {};
 }
 
-function buildGraphqlHeaders({ searchUrl, cookieHeader, bootstrapData }) {
+function buildGraphqlHeaders({ searchUrl, bootstrapData }) {
     return {
-        'user-agent': IOS_SAFARI_USER_AGENT,
         accept: 'application/json, text/plain, */*',
-        'accept-language': 'en-US,en;q=0.9',
         'accept-encoding': 'gzip, deflate',
         'content-type': 'application/json',
         'client-info': bootstrapData.clientInfo,
@@ -996,10 +964,6 @@ function buildGraphqlHeaders({ searchUrl, cookieHeader, bootstrapData }) {
         'ctx-view-id': bootstrapData.ctxViewId,
         origin: 'https://www.expedia.com',
         referer: searchUrl,
-        ...(cookieHeader ? { cookie: cookieHeader } : {}),
-        'sec-fetch-dest': 'empty',
-        'sec-fetch-mode': 'cors',
-        'sec-fetch-site': 'same-origin',
     };
 }
 
@@ -1025,10 +989,7 @@ async function fetchSearchPage({ searchUrl, proxyUrl, profile }) {
     const listingResponse = await makeImpitRequest({
         url: searchUrl,
         method: 'GET',
-        headers: {
-            ...buildWarmupHeaders({ referer: HOME_URL, profile }),
-            ...(cookieHeader ? { cookie: cookieHeader } : {}),
-        },
+        headers: buildWarmupHeaders({ referer: HOME_URL, profile }),
         proxyUrl,
         timeout: 30_000,
         browser: profile.browser,
@@ -1201,12 +1162,12 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     throw new Error(`Could not initialize Expedia search session from startUrl. ${lastError?.message || ''}`.trim());
 }
 
-async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, cookieHeader, bootstrapData, payload, cookieState }) {
+async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, bootstrapData, payload }) {
     return retryWithBackoff(async () => {
         const response = await makeImpitRequest({
             url: graphQlUrl,
             method: 'POST',
-            headers: buildGraphqlHeaders({ searchUrl, cookieHeader, bootstrapData }),
+            headers: buildGraphqlHeaders({ searchUrl, bootstrapData }),
             body: JSON.stringify([payload]),
             proxyUrl,
             browser,
@@ -1220,15 +1181,12 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, coo
         }
 
         if (response.statusCode === 429) {
+            const retryAfter = getHeaderValue(response.headers, 'retry-after');
+            const retryAfterMs = retryAfter ? Number(retryAfter) * 1000 : undefined;
             const error = createHttpStatusError('PropertyListingQuery received a 429 response; rotating the warmed Expedia session.', 429);
             error.rateLimitedSession = true;
+            error.retryAfterMs = retryAfterMs;
             throw error;
-        }
-
-        const newCookies = extractCookiesFromHeaders(response.headers);
-        if (cookieState && newCookies) {
-            // eslint-disable-next-line no-param-reassign
-            cookieState.cookieHeader = mergeCookieHeaderStrings(cookieState.cookieHeader, newCookies);
         }
 
         if (response.statusCode < 200 || response.statusCode >= 400) {
@@ -1332,7 +1290,6 @@ async function main() {
     const records = [];
     let startIndex = searchSession.bootstrapData.resultsStartingIndex;
     const batchSize = searchSession.bootstrapData.resultsSize;
-    const cookieState = { cookieHeader: searchSession.cookieHeader };
 
     for (let pageNumber = 1; pageNumber <= maxPages && records.length < resultsWanted; pageNumber++) {
         let payload = buildRequestPayload({
@@ -1349,10 +1306,8 @@ async function main() {
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
                 proxyUrl: searchSession.proxyUrl,
                 browser: searchSession.browser,
-                cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
                 payload,
-                cookieState,
             });
         } catch (error) {
             log.warning('Listing batch failed, refreshing the search session before retrying once.', {
@@ -1365,7 +1320,6 @@ async function main() {
                 searchUrlCandidates: [normalizedInput.startUrl, ...searchUrlCandidates],
                 proxyStrategies,
             });
-            cookieState.cookieHeader = searchSession.cookieHeader;
             normalizedInput = resolveNormalizedSearchInput(
                 parseStartUrlSearchInput(searchSession.pageResponse.url || searchSession.searchUrl),
                 parseStartUrlSearchInput(normalizedInput.startUrl),
@@ -1384,10 +1338,8 @@ async function main() {
                 searchUrl: searchSession.pageResponse.url || searchSession.searchUrl,
                 proxyUrl: searchSession.proxyUrl,
                 browser: searchSession.browser,
-                cookieHeader: cookieState.cookieHeader,
                 bootstrapData: searchSession.bootstrapData,
                 payload,
-                cookieState,
             });
         }
 
