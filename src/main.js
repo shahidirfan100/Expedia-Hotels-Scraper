@@ -16,15 +16,11 @@ const HOME_URL = 'https://www.expedia.com/';
 const WARMUP_PROFILES = [
     {
         name: 'chrome142',
-        browser: 'chrome',
-    },
-    {
-        name: 'ios18',
-        browser: 'ios18',
+        browser: 'chrome142',
     },
     {
         name: 'firefox144',
-        browser: 'firefox',
+        browser: 'firefox144',
     },
 ];
 const HOTEL_LISTING_PAGE_ID_FALLBACK = 'page.Hotel-Search,H,20';
