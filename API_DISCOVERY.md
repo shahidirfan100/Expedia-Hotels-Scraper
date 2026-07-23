@@ -38,8 +38,10 @@ Warmup profiles rotate per attempt and then cycle:
 
 | Attempt | Profile | Transport | Notes |
 |---:|---|---|---|
-| 1 | `ios18-safari` | impit ios18 | iOS 18 system TLS fingerprint (matches Safari, Chrome iOS, Firefox iOS — all use NSURLSession). Device context: MOBILE. |
-| 2 | `chrome-desktop` | impit chrome | Chrome desktop TLS fingerprint. Device context: DESKTOP. |
+| 1 | `chrome142` | impit chrome | Desktop Chrome TLS fingerprint. Device context: DESKTOP. |
+| 2 | `ios18` | impit ios18 | iOS 18 system TLS fingerprint (matches Safari, Chrome iOS, Firefox iOS — all use NSURLSession). Device context: DESKTOP in GraphQL. |
+| 3 | `firefox144` | impit firefox | Firefox Desktop TLS fingerprint. Device context: DESKTOP. |
+| 4 | `chrome142` | impit chrome | Cycle repeats from attempt 1 |
 | Any | any profile | any | rejected when status is 429 and `x-page-id` is `wildcard-challenge-handler` |
 
 Implementation notes:
