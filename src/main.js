@@ -19,6 +19,10 @@ const WARMUP_PROFILES = [
         browser: 'chrome142',
     },
     {
+        name: 'chrome131',
+        browser: 'chrome131',
+    },
+    {
         name: 'firefox144',
         browser: 'firefox144',
     },
@@ -1010,7 +1014,6 @@ function buildGraphqlHeaders({ searchUrl, bootstrapData, cookieHeader }) {
     return {
         accept: 'application/json, text/plain, */*',
         'accept-language': 'en-US,en;q=0.9',
-        'accept-encoding': 'gzip, deflate',
         'content-type': 'application/json',
         'client-info': bootstrapData.clientInfo,
         'device-user-agent-id': bootstrapData.duaid,
