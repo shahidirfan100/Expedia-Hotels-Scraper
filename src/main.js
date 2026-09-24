@@ -8,24 +8,16 @@ import { CookieJar } from 'tough-cookie';
 await Actor.init();
 
 const PROPERTY_LISTING_QUERY = {
-    operationName: 'PropertyListingQuery',
-    hash: '82abb7da6738db4c904e4d10130072236a751b5a315f6dfaf92474793597bc33',
+    operationName: 'RemainderListings',
+    hash: '657c1c854b7f6469e603e5fc4f03aa9a99bd2df9796bfd5daa8820113cdb39e8',
 };
 
 const HOME_URL = 'https://www.expedia.com/';
 const WARMUP_PROFILES = [
-    {
-        name: 'chrome142',
-        browser: 'chrome142',
-    },
-    {
-        name: 'chrome131',
-        browser: 'chrome131',
-    },
-    {
-        name: 'firefox144',
-        browser: 'firefox144',
-    },
+    { browser: 'chrome151' },
+    { browser: 'chrome142' },
+    { browser: 'chrome131' },
+    { browser: 'firefox144' },
 ];
 const HOTEL_LISTING_PAGE_ID_FALLBACK = 'page.Hotel-Search,H,20';
 const HOTEL_LISTING_CLIENT_INFO_FALLBACK = 'shopping-pwa,unknown,us-east-1';
@@ -485,10 +477,11 @@ async function retryWithBackoff(fn, options = {}) {
                 maxBackoffMs,
                 retryAfterMs || baseBackoffMs * 2 ** (attempt - 1) + (statusCode === 429 ? 2000 : 0) + jitter,
             );
-            log.warning(`${label} failed (attempt ${attempt}/${maxAttempts}), retrying in ${delay}ms`, {
-                statusCode,
-                message: toErrorMessage(error),
-            });
+            log.warning(
+                statusCode
+                    ? `${label} request returned HTTP ${statusCode}; retrying.`
+                    : `${label} request failed temporarily; retrying.`,
+            );
             await sleep(delay);
         }
     }
@@ -496,11 +489,6 @@ async function retryWithBackoff(fn, options = {}) {
     throw lastError;
 }
 
-function toErrorMessage(error) {
-    if (!error) return 'Unknown error';
-    if (typeof error === 'string') return error;
-    return cleanText(error.message) || 'Unknown error';
-}
 
 function createHttpStatusError(message, statusCode) {
     const error = new Error(message);
@@ -534,6 +522,24 @@ function isBootstrapRetryableError(error) {
 
     const message = cleanText(error?.message) || '';
     return /upstream5\d\d|proxy responded with 59\d/i.test(message);
+}
+
+function shouldRefreshSearchSession(error) {
+    if (error?.persistedQueryNotFound) return false;
+    if (error?.challengeSession || error?.rateLimitedSession) return true;
+
+    const statusCode = getErrorStatusCode(error);
+    if (statusCode !== undefined) {
+        return (
+            GRAPHQL_RETRYABLE_STATUS_CODES.has(statusCode) ||
+            (statusCode >= 590 && statusCode <= 599)
+        );
+    }
+
+    const code = cleanText(error?.code) || '';
+    if (GRAPHQL_RETRYABLE_ERROR_CODES.has(code)) return true;
+
+    return /timeout|econnreset|eai_again|etimedout|enotfound|enetunreach/i.test(error?.message || '');
 }
 
 function getBootstrapBackoffMs({ attempt, statusCode }) {
@@ -583,10 +589,8 @@ async function buildProxyStrategies(proxyInput) {
         try {
             userProxyConfiguration = await Actor.createProxyConfiguration(normalizedProxyInput);
             if (userProxyConfiguration) addStrategy('input_proxy_configuration', userProxyConfiguration);
-        } catch (error) {
-            log.warning('Proxy configuration initialization failed, continuing with fallback strategies.', {
-                message: toErrorMessage(error),
-            });
+        } catch {
+            log.warning('Proxy configuration could not be initialized; using the available fallback.');
         }
     }
 
@@ -740,7 +744,6 @@ function buildBootstrapData(html, cookieHeader) {
     const awsRegion = extractMatch(normalizedHtml, /"awsRegion":"([^"]+)"/);
     const pageId = extractMatch(normalizedHtml, /"pageId":"([^"]+)"/);
     const searchId = extractMatch(normalizedHtml, /"searchId":"([^"]+)"/);
-    const productOffersId = extractMatch(normalizedHtml, /"productOffersId":"([^"]+)"/);
     const duaid = getCookieValue(cookieHeader, 'DUAID');
     const resultsStartingIndex = toInteger(extractMatch(normalizedHtml, /"resultsStartingIndex":(\d+)/));
     const resultsSize = toInteger(extractMatch(normalizedHtml, /"resultsSize":(\d+)/));
@@ -751,7 +754,6 @@ function buildBootstrapData(html, cookieHeader) {
     if (!awsRegion) missing.push('awsRegion');
     if (!pageId) missing.push('pageId');
     if (!searchId) missing.push('searchId');
-    if (!productOffersId) missing.push('productOffersId');
     if (!duaid) missing.push('DUAID cookie');
 
     if (missing.length) {
@@ -762,7 +764,6 @@ function buildBootstrapData(html, cookieHeader) {
         clientInfo: normalizeHotelClientInfo(`${applicationName},${applicationVersion},${awsRegion}`),
         pageId: normalizeHotelPageId(pageId),
         searchId,
-        productOffersId,
         duaid,
         resultsStartingIndex: resultsStartingIndex ?? 3,
         resultsSize: resultsSize ?? 97,
@@ -816,6 +817,7 @@ function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
     return {
         operationName: PROPERTY_LISTING_QUERY.operationName,
         variables: {
+            isMultiItem: false,
             context: {
                 siteId: 1,
                 locale: 'en_US',
@@ -831,16 +833,10 @@ function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
             },
             criteria: {
                 primary: {
-                    dateRange: {
-                        checkInDate: parseDateParts(input.checkInDate),
-                        checkOutDate: parseDateParts(input.checkOutDate),
-                    },
                     destination: {
                         regionName: cleanText(input.destination),
                         regionId: cleanText(input.regionId),
                         coordinates: null,
-                        pinnedPropertyId: null,
-                        propertyIds: null,
                         mapBounds: null,
                     },
                     rooms: [
@@ -849,25 +845,26 @@ function buildRequestPayload({ input, bootstrapData, startIndex, size }) {
                             children: children.map((age) => ({ age })),
                         },
                     ],
+                    dateRange: {
+                        checkInDate: parseDateParts(input.checkInDate),
+                        checkOutDate: parseDateParts(input.checkOutDate),
+                    },
                 },
                 secondary: {
-                    counts: [
-                        { id: 'resultsStartingIndex', value: startIndex },
-                        { id: 'resultsSize', value: size },
-                    ],
-                    booleans: [],
+                    ranges: [],
                     selections: [
-                        { id: 'privacyTrackingState', value: 'CAN_TRACK' },
-                        { id: 'productOffersId', value: bootstrapData.productOffersId },
                         { id: 'searchId', value: bootstrapData.searchId },
                         { id: 'sort', value: cleanText(input.sort) || 'RECOMMENDED' },
                         { id: 'useRewards', value: 'SHOP_WITHOUT_POINTS' },
                     ],
-                    ranges: [],
+                    booleans: [],
+                    counts: [
+                        { id: 'resultsStartingIndex', value: startIndex },
+                        { id: 'resultsSize', value: size },
+                    ],
                 },
             },
             shoppingContext: {
-                multiItem: null,
                 queryTriggeredBy: 'PAGE-LOAD',
                 typeaheadCollationId: null,
             },
@@ -1070,11 +1067,6 @@ async function fetchSearchPage({ searchUrl, proxyUrl, profile }) {
 
     cookieHeader = mergeCookieHeaderStrings(cookieHeader, extractCookiesFromHeaders(listingResponse.headers));
 
-    log.info('Expedia hotel warmup completed', {
-        homeStatusCode: homeResponse.statusCode,
-        listingStatusCode: listingResponse.statusCode,
-        hasCookies: Boolean(cookieHeader),
-    });
 
     const hasValidListingResponse =
         listingResponse.statusCode >= 200 &&
@@ -1115,7 +1107,7 @@ async function loadApiDiscoveryOverrides() {
 
 async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) {
     let lastError;
-    const suppressedFailures = [];
+    let suppressedFailures = 0;
     let lastHadProxy = false;
 
     for (const strategy of proxyStrategies) {
@@ -1133,21 +1125,11 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     proxyUrl = await strategy.proxyConfiguration.newUrl(sessionId);
                 } catch (error) {
                     lastError = error;
-                    log.warning('Proxy URL generation failed, switching strategy.', {
-                        strategy: strategy.label,
-                        attempt,
-                        message: toErrorMessage(error),
-                    });
+                    log.warning('Proxy connection could not be initialized; trying the available fallback.');
                     break;
                 }
             }
 
-            log.info('Expedia hotel warmup attempt', {
-                attempt,
-                maxAttempts,
-                profile: profile.name,
-                usingProxy: Boolean(proxyUrl),
-            });
 
             for (const [candidateIndex, searchUrl] of searchUrlCandidates.entries()) {
                 try {
@@ -1158,23 +1140,19 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     bootstrapData.pageId = pageResponse.headerPageId || bootstrapData.pageId;
                     bootstrapData.clientInfo = pageResponse.headerClientInfo || bootstrapData.clientInfo;
 
-                    if (suppressedFailures.length) {
-                        log.info('Recovered Expedia bootstrap session after rotating proxy/profile.', {
-                            suppressedFailures: suppressedFailures.length,
-                            proxyStrategy: strategy.label,
-                            warmupProfile: profile.name,
-                        });
-                    }
+                    log.info(
+                        suppressedFailures
+                            ? 'Expedia search session recovered after a warmup retry.'
+                            : 'Expedia search session ready.',
+                    );
 
                     return {
                         pageResponse,
                         searchUrl,
                         proxyUrl,
-                        warmupProfile: profile.name,
                         browser: profile.browser,
                         cookieHeader,
                         bootstrapData,
-                        proxyStrategy: strategy.label,
                     };
                 } catch (error) {
                     lastError = error;
@@ -1182,26 +1160,14 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
                     const retryable = isBootstrapRetryableError(error);
                     const skipRemainingSearchUrls =
                         shouldSkipRemainingSearchUrls(error) && candidateIndex < searchUrlCandidates.length - 1;
-                    suppressedFailures.push({
-                        strategy: strategy.label,
-                        profile: profile.name,
-                        attempt,
-                        statusCode,
-                        message: toErrorMessage(error),
-                    });
+                    suppressedFailures++;
 
                     if (retryable) {
                         if (candidateIndex === searchUrlCandidates.length - 1) {
                             await sleep(getBootstrapBackoffMs({ attempt, statusCode }));
                         }
                     } else {
-                        log.warning('Bootstrap failed with non-retryable error.', {
-                            strategy: strategy.label,
-                            attempt,
-                            profile: profile.name,
-                            statusCode,
-                            message: toErrorMessage(error),
-                        });
+                        log.warning('Expedia warmup failed; trying another session.');
                     }
 
                     if (skipRemainingSearchUrls) {
@@ -1213,12 +1179,8 @@ async function bootstrapSearchSession({ searchUrlCandidates, proxyStrategies }) 
     }
 
     const statusCode = getErrorStatusCode(lastError);
-    if (suppressedFailures.length) {
-        log.warning('Expedia bootstrap failed after rotating all proxy/profile candidates.', {
-            suppressedFailures: suppressedFailures.length,
-            lastStatusCode: statusCode,
-            lastMessage: toErrorMessage(lastError),
-        });
+    if (suppressedFailures) {
+        log.warning('Expedia could not establish a search session after retries.');
     }
 
     if (statusCode === 429 || statusCode === 403) {
@@ -1253,7 +1215,7 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, boo
                 getHeaderValue(response.headers, 'x-page-id') === 'wildcard-challenge-handler'
             ) {
                 const error = createHttpStatusError(
-                    'PropertyListingQuery received a 429 wildcard challenge session.',
+                    'RemainderListings received a 429 wildcard challenge session.',
                     429,
                 );
                 error.challengeSession = true;
@@ -1264,7 +1226,7 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, boo
                 const retryAfter = getHeaderValue(response.headers, 'retry-after');
                 const retryAfterMs = retryAfter ? Number(retryAfter) * 1000 : undefined;
                 const error = createHttpStatusError(
-                    'PropertyListingQuery received a 429 response; rotating the warmed Expedia session.',
+                    'RemainderListings received a 429 response; rotating the warmed Expedia session.',
                     429,
                 );
                 error.rateLimitedSession = true;
@@ -1273,7 +1235,7 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, boo
             }
 
             if (response.statusCode < 200 || response.statusCode >= 400) {
-                const error = new Error(`PropertyListingQuery failed with status ${response.statusCode}`);
+                const error = new Error(`RemainderListings failed with status ${response.statusCode}`);
                 error.statusCode = response.statusCode;
                 throw error;
             }
@@ -1282,26 +1244,37 @@ async function fetchListingBatch({ graphQlUrl, searchUrl, proxyUrl, browser, boo
             try {
                 responseJson = JSON.parse(response.body);
             } catch {
-                throw new Error('PropertyListingQuery returned a non-JSON response.');
+                const contentType = getHeaderValue(response.headers, 'content-type') || '';
+                const isHtmlResponse =
+                    /text\/html|application\/xhtml\+xml/i.test(contentType) ||
+                    /^\s*<(?:!doctype\s+html|html)\b/i.test(response.body);
+                const error = new Error('RemainderListings returned a non-JSON response.');
+                error.statusCode = response.statusCode;
+                if (isHtmlResponse) error.challengeSession = true;
+                throw error;
             }
 
             const result = Array.isArray(responseJson) ? responseJson[0] : responseJson;
             const hasErrors = Array.isArray(result?.errors) && result.errors.length;
             if (hasErrors) {
                 const messages = result.errors.map((entry) => entry.message).filter(Boolean);
-                const isFatal = messages.some((m) =>
-                    /persistedquerynotfound|not found|unauthorized|forbidden/i.test(m),
-                );
+                if (messages.some((message) => /persistedquerynotfound/i.test(message))) {
+                    const error = new Error(
+                        'Expedia did not recognize the RemainderListings persisted-query hash. Refresh the operation name and hash from a live Hotel-Search request in API_DISCOVERY.md; retrying a new session with the same hash will not help.',
+                    );
+                    error.persistedQueryNotFound = true;
+                    throw error;
+                }
+
+                const isFatal = messages.some((message) => /not found|unauthorized|forbidden/i.test(message));
                 if (isFatal) throw new Error(messages.join('; '));
-                log.warning('GraphQL response contained non-fatal errors, continuing with partial data.', {
-                    errors: messages.join('; '),
-                });
+                log.warning('GraphQL returned partial data after non-fatal errors.');
             }
 
             return result;
         },
         {
-            label: 'PropertyListingQuery',
+            label: 'RemainderListings',
             maxAttempts: GRAPHQL_MAX_ATTEMPTS,
             baseBackoffMs: GRAPHQL_BASE_BACKOFF_MS,
             maxBackoffMs: GRAPHQL_MAX_BACKOFF_MS,
@@ -1316,13 +1289,7 @@ async function main() {
     if (apiDiscoveryOverrides.operationName) PROPERTY_LISTING_QUERY.operationName = apiDiscoveryOverrides.operationName;
     if (apiDiscoveryOverrides.persistedQueryHash)
         PROPERTY_LISTING_QUERY.hash = apiDiscoveryOverrides.persistedQueryHash;
-    if (Object.keys(apiDiscoveryOverrides).length) {
-        log.info('Loaded API discovery overrides.', {
-            operationName: apiDiscoveryOverrides.operationName || PROPERTY_LISTING_QUERY.operationName,
-            operationHash: apiDiscoveryOverrides.persistedQueryHash || PROPERTY_LISTING_QUERY.hash,
-            endpoint: apiDiscoveryOverrides.endpoint || 'derived_from_search_page',
-        });
-    }
+
     const {
         startUrl: startUrlRaw,
         resultsWanted: resultsWantedCamelRaw,
@@ -1347,11 +1314,6 @@ async function main() {
 
     const effectiveProxyInput = proxyInput ?? schemaDefaults.proxyConfiguration;
     const proxyStrategies = await buildProxyStrategies(effectiveProxyInput);
-    const [primaryProxyStrategy, ...fallbackProxyStrategies] = proxyStrategies.map((entry) => entry.label);
-    log.info('Prepared proxy strategy.', {
-        primary: primaryProxyStrategy,
-        fallbacks: fallbackProxyStrategies,
-    });
     const scrapedAt = new Date().toISOString();
 
     let searchSession = await bootstrapSearchSession({ searchUrlCandidates, proxyStrategies });
@@ -1364,17 +1326,7 @@ async function main() {
         apiDiscoveryOverrides.endpoint ||
         new URL('/graphql', searchSession.pageResponse.url || searchSession.searchUrl).toString();
 
-    log.info('Starting Expedia hotel listing extraction', {
-        startUrl: normalizedInput.startUrl,
-        recoveryCandidates: searchUrlCandidates.length,
-        operationName: PROPERTY_LISTING_QUERY.operationName,
-        operationHash: PROPERTY_LISTING_QUERY.hash,
-        resultsWanted,
-        maxPages,
-        usingProxy: Boolean(searchSession.proxyUrl),
-        proxyStrategy: searchSession.proxyStrategy,
-        warmupProfile: searchSession.warmupProfile,
-    });
+    log.info('Starting Expedia hotel listing extraction.');
 
     const seenHotelIds = new Set();
     const records = [];
@@ -1402,11 +1354,9 @@ async function main() {
                 cookieHeader,
             });
         } catch (error) {
-            log.warning('Listing batch failed, refreshing the search session before retrying once.', {
-                pageNumber,
-                startIndex,
-                message: error.message,
-            });
+            if (!shouldRefreshSearchSession(error)) throw error;
+
+            log.warning('Expedia listing request failed transiently; refreshing the session.');
 
             searchSession = await bootstrapSearchSession({
                 searchUrlCandidates: [normalizedInput.startUrl, ...searchUrlCandidates],
@@ -1449,6 +1399,7 @@ async function main() {
         if (!cards.length) break;
 
         const pageRecords = [];
+        let skippedCardCount = 0;
         for (const card of cards) {
             if (records.length >= resultsWanted) break;
 
@@ -1468,21 +1419,20 @@ async function main() {
                 seenHotelIds.add(record.hotel_id);
                 records.push(record);
                 pageRecords.push(record);
-            } catch (error) {
-                log.warning('Skipped hotel card due to processing error.', {
-                    hotelId: cleanText(card?.id),
-                    message: toErrorMessage(error),
-                });
+            } catch {
+                skippedCardCount++;
             }
+        }
+
+        if (skippedCardCount) {
+            log.warning(`Skipped ${skippedCardCount} hotel listings that could not be processed.`);
         }
 
         if (pageRecords.length) {
             await Dataset.pushData(pageRecords);
         }
 
-        log.info(`Saved ${records.length}/${resultsWanted} hotel listings after page ${pageNumber}`, {
-            batchSaved: pageRecords.length,
-        });
+        log.info(`Saved ${pageRecords.length} hotel listings; ${records.length} saved total.`);
 
         if (cards.length < batchSize) break;
         startIndex += batchSize;
@@ -1501,10 +1451,7 @@ async function main() {
         );
     }
 
-    log.info('Finished successfully', {
-        saved: records.length,
-        requested: resultsWanted,
-    });
+    log.info(`Finished successfully. Saved ${records.length} hotel listings.`);
 }
 
 try {

@@ -7,14 +7,15 @@ Applies to **Hotels**, **Reviews**, **Car Rental**, **Flights**, **Packages** �
 
 ## 1. Browser Profiles — Which Actually Work
 
-impit v0.14.3 maps JS strings to Rust fingerprint functions:
+The actor currently uses impit v0.14.5, which adds the Chrome 151 fingerprint. The package maps these JS strings to Rust fingerprint functions:
 
 | JS string | Real browser | Works on Expedia |
 |---|---|---|
-| `"chrome"`, `"chrome124"` | Chrome 124 | ✅ |
-| `"chrome131"` | Chrome 131 | ✅ |
-| `"chrome136"` | Chrome 136 | ✅ |
+| `"chrome151"` | Chrome 151 | ✅ (actor smoke-tested 2026-09-24) |
 | `"chrome142"` | Chrome 142 | ✅ |
+| `"chrome136"` | Chrome 136 | ✅ |
+| `"chrome131"` | Chrome 131 | ✅ |
+| `"chrome"`, `"chrome124"` | Generic/Chrome 124 | ❌ 429 challenge |
 | `"firefox133"` | Firefox 133 | ✅ |
 | `"firefox135"` | Firefox 135 | ✅ |
 | `"firefox144"` | Firefox 144 | ✅ |
@@ -25,8 +26,7 @@ impit v0.14.3 maps JS strings to Rust fingerprint functions:
 | `"firefox"`, `"firefox128"` | Firefox 128 | ❌ connection failures |
 | `"ios18"` | iOS 18 Safari | ❌ 429 challenge |
 
-**Rule:** Only the **latest 4 Chrome versions** and **latest 3 Firefox versions** pass Akamai.  
-Old versions and iOS Safari from non-iOS IPs are always blocked.
+**Rule:** Prefer the newest Expedia-compatible fingerprint supported by the installed Impit version. `chrome151` is the current actor primary; `chrome142`, `chrome131`, and `firefox144` remain fallbacks. Old versions and iOS Safari from non-iOS IPs are blocked according to the current test notes.
 
 ---
 
@@ -125,7 +125,7 @@ Mobile device types (`MOBILE`, `TABLET`) are rejected. This is independent of wh
 import { CookieJar } from 'tough-cookie';
 
 const cookieJar = new CookieJar();
-const impit = new Impit({ browser: 'chrome142', cookieJar });
+const impit = new Impit({ browser: 'chrome151', cookieJar });
 ```
 
 - impit stores `Set-Cookie` in the jar automatically
@@ -151,6 +151,7 @@ For the direct fallback, limit warmup to 2 attempts instead of 8.
 
 ```js
 const WARMUP_PROFILES = [
+    { name: 'chrome151', browser: 'chrome151' },
     { name: 'chrome142', browser: 'chrome142' },
     { name: 'chrome131', browser: 'chrome131' },
     { name: 'firefox144', browser: 'firefox144' },
@@ -161,10 +162,11 @@ const WARMUP_PROFILES = [
 
 Rotation logic:
 ```
-attempt 1 → chrome142
-attempt 2 → chrome131
-attempt 3 → firefox144
-attempt 4 → chrome142 (cycle back)
+attempt 1 → chrome151
+attempt 2 → chrome142
+attempt 3 → chrome131
+attempt 4 → firefox144
+attempt 5 → chrome151 (cycle back)
 ...
 ```
 
@@ -210,7 +212,7 @@ Each vertical uses the same **warmup** strategy but different **GraphQL** config
 | 429 on GraphQL after successful warmup | Missing `sec-fetch-*` fetch context headers on POST | Add `sec-fetch-dest: empty`, `sec-fetch-mode: cors`, `sec-fetch-site: same-origin` |
 | 429 on GraphQL after successful warmup | Missing `accept-language` on POST | Add `accept-language: en-US,en;q=0.9` |
 | 429 on GraphQL after successful warmup | Missing `cookie` header on POST | Manually pass cookie from warmup response |
-| 429 wildcard challenge on warmup | Browser fingerprint too old | Use `chrome142`, `chrome131`, or `firefox144` only |
+| 429 wildcard challenge on warmup | Browser fingerprint too old | Prefer `chrome151`; fall back to `chrome142`, `chrome131`, or `firefox144` |
 | 429 wildcard challenge on warmup | iOS/mobile browser from non-iOS IP | Never use `ios18` without an iOS-residential proxy |
 | 429 wildcard challenge on warmup | Missing navigation `sec-fetch-*` headers on GET | Add `sec-fetch-mode: navigate`, `sec-fetch-dest: document`, `sec-fetch-user: ?1` |
 | 403 on warmup | Missing `client-info`, wrong headers | Ensure `client-info: domain-redirect:true` on warmup GET |
@@ -227,7 +229,7 @@ import { Impit } from 'impit';
 import { CookieJar } from 'tough-cookie';
 
 const impit = new Impit({
-    browser: 'chrome142',       // or 'chrome131' / 'firefox144'
+    browser: 'chrome151',       // or 'chrome142' / 'chrome131' / 'firefox144'
     cookieJar: new CookieJar(),
     ignoreTlsErrors: true,
 });

@@ -166,7 +166,7 @@ Residential proxies improve reliability on Expedia result pages:
   "sort": "RECOMMENDED",
   "search_id": "cb481b56-f4b8-4f49-8d4a-9ab98d138245",
   "source_url": "https://www.expedia.com/graphql",
-  "operation_name": "PropertyListingQuery",
+  "operation_name": "RemainderListings",
   "scraped_at": "2026-07-22T16:16:50.038Z"
 }
 ```
